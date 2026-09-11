@@ -1,0 +1,27 @@
+# Secrets / local env — NEVER commit real values of these
+.env
+.env.*
+*.pem
+*.key
+
+# Local/dev database + vector store artifacts (SqliteBackend, NumpyVectorStore)
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+vector_store*/
+*.vecs.npy
+*.ids.json
+
+# Model weights (large, fetched separately per main.py's MODEL SETUP notes)
+models/
+*.gguf
+
+# Benchmark / validation output (regenerate, don't commit)
+benchmark_report.json
+qwen_validation_report.json
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
