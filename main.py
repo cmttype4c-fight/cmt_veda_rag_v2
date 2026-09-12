@@ -39,7 +39,7 @@ from db import get_backend, DuplicateDocumentError, TurnRecord
 from embeddings import get_embedding_backend
 from vector_store import get_vector_store
 from retrieval import HybridRetriever, Candidate, assess_evidence_sufficiency
-from generation import build_messages, validate_citations, get_generator
+from generation import build_messages, validate_citations, get_generator, fit_candidates_to_token_budget, ContextBudgetError
 from ingestion_pipeline import IngestionInput, ingest_document, remove_document, IngestionValidationError
 from url_safety import sanitize_reference_url
 from conversation import FallbackQueryRewriter, LLMQueryRewriter, is_authorized_for_conversation
@@ -289,9 +289,38 @@ def ask(
         )
 
     final_candidates = assessment.supporting_chunks[: config.FINAL_CONTEXT_CHUNKS_MAX]
-    messages, max_tokens = build_messages(effective_question, final_candidates, persona, payload.answer_length, payload.table_format)
-
     generator = state["generator"]
+
+    # Token-based context fit (fixes a real deployment crash:
+    # "Requested tokens (16023) exceed context window of 4096" — see
+    # generation.py's fit_candidates_to_token_budget docstring for the
+    # full diagnosis). Drops least-relevant candidates until the ACTUAL
+    # tokenized prompt fits n_ctx, rather than guessing from character
+    # counts.
+    try:
+        messages, max_tokens, final_candidates, dropped = fit_candidates_to_token_budget(
+            effective_question, final_candidates, persona, payload.answer_length,
+            payload.table_format, generator, n_ctx=config.N_CTX,
+            safety_margin_tokens=config.CONTEXT_SAFETY_MARGIN_TOKENS,
+        )
+        if dropped:
+            logger.warning(
+                "Dropped %s lowest-ranked candidate(s) to fit n_ctx=%s for question %r",
+                dropped, config.N_CTX, effective_question,
+            )
+    except ContextBudgetError as e:
+        # Even zero evidence chunks don't fit — a genuine capacity
+        # problem (answer_length/persona prompt too large for this
+        # n_ctx), not something to paper over with a fabricated answer.
+        logger.error("Context budget error for question %r: %s", effective_question, e)
+        db.record_answer_audit(persona.value, scope, config.KNOWLEDGE_VERSION, [], [], True)
+        return AskResponse(
+            answer=INSUFFICIENT_EVIDENCE_MESSAGE, sources=[],
+            knowledge_version=config.KNOWLEDGE_VERSION, insufficient_evidence=True,
+            conversation_id=conversation_id,
+            rewritten_question=effective_question if effective_question != question else None,
+        )
+
     with _gen_lock:
         raw_answer = generator.generate(messages, max_tokens)
 
