@@ -35,6 +35,7 @@ from config import (
     FINAL_CONTEXT_CHUNKS_MIN, FINAL_CONTEXT_CHUNKS_MAX,
     WEIGHT_SEMANTIC, WEIGHT_LEXICAL, WEIGHT_METADATA,
     EVIDENCE_SCORE_FLOOR, EVIDENCE_MIN_SUPPORTING_CHUNKS,
+    LEXICAL_SATURATION,
 )
 from entities import extract_entities, classify_query_scope, ExtractedEntities
 from db import DBBackend
@@ -122,7 +123,7 @@ def rerank(
             + WEIGHT_METADATA * c.metadata_score
         )
 
-        lexical_saturated = min(c.lexical_score / 5.0, 1.0)
+        lexical_saturated = min(c.lexical_score / LEXICAL_SATURATION, 1.0)
         c.confidence = (
             WEIGHT_SEMANTIC * c.semantic_score
             + WEIGHT_LEXICAL * lexical_saturated
