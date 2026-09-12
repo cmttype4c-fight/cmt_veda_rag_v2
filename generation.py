@@ -9,7 +9,7 @@ and validates the model's citations against what was actually retrieved
 import re
 from dataclasses import dataclass
 
-from config import Persona, LENGTH_PRESETS, TABLE_INSTRUCTIONS, INSUFFICIENT_EVIDENCE_MESSAGE
+from config import Persona, LENGTH_PRESETS, TABLE_INSTRUCTIONS, INSUFFICIENT_EVIDENCE_MESSAGE, CONTEXT_CHARS_PER_CHUNK
 from retrieval import Candidate
 
 PERSONA_INSTRUCTIONS = {
@@ -102,8 +102,19 @@ def build_messages(
     for c in candidates:
         tier = c.metadata.get("source_tier", "unspecified")
         section = c.section or "body"
+        # BUG FIX: CONTEXT_CHARS_PER_CHUNK was declared in config.py but
+        # never actually applied here — every candidate's FULL text (up
+        # to ingestion.py's MAX_CHUNK_CHARS=1800 per chunk) was going
+        # into the prompt uncapped. Found via a real deployment: this is
+        # very likely the primary contributor to the reported
+        # "Requested tokens (16023) exceed context window of 4096"
+        # crash. This per-chunk cap is a CHEAP FIRST PASS, not the
+        # authoritative fit-check — see fit_candidates_to_token_budget()
+        # below for the real (token-based, not character-based) budget
+        # enforcement that should run before generation.
+        text = c.text[:CONTEXT_CHARS_PER_CHUNK]
         context_blocks.append(
-            f"[{c.source_id}] (section: {section}; source_tier: {tier})\n{c.text}"
+            f"[{c.source_id}] (section: {section}; source_tier: {tier})\n{text}"
         )
     context = "\n\n".join(context_blocks)
 
@@ -118,6 +129,75 @@ def build_messages(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ], length_cfg["max_tokens"]
+
+
+def fit_candidates_to_token_budget(
+    question: str,
+    candidates: list[Candidate],
+    persona: Persona,
+    answer_length: str,
+    table_format: str,
+    generator: "Generator",
+    n_ctx: int,
+    safety_margin_tokens: int = 128,
+):
+    """THE authoritative context-fit check — token-based, not character-
+    based (directly answers "should the repository calculate a
+    token-based prompt budget": yes, and this is it).
+
+    Why a character budget alone is never reliable: characters-per-token
+    varies by content. English prose is roughly 4 chars/token, but this
+    corpus's chunks are full of things that tokenize far less
+    efficiently in a general BPE vocabulary — gene symbols ("SH3TC2"),
+    HGVS mutation notation ("p.Arg1109X"), and (per a real deployment's
+    own finding) PDF-extraction artifacts that occasionally needed NUL-
+    byte stripping — any residual extraction noise tokenizes worse
+    still. A fixed character cap picked without measuring real tokens
+    against the real tokenizer is exactly the same category of mistake
+    that caused the original bug (a config value that LOOKED like it
+    would bound the prompt but was never verified against what the
+    model actually receives).
+
+    `candidates` MUST already be ranked most-relevant-first (this is
+    guaranteed by retrieval.py's rerank() + the evidence gate) — when the
+    prompt doesn't fit, this drops from the END (least relevant) first,
+    one at a time, and rebuilds, rather than doing anything based on
+    character count.
+
+    Returns (messages, max_tokens, final_candidates, dropped_count).
+    `final_candidates` may be a strict subset of the input — the caller
+    should use it (not the original list) for anything downstream that
+    needs to match what the model actually saw (e.g. which Source IDs
+    can legitimately be cited).
+    """
+    remaining = list(candidates)
+    dropped = 0
+    while True:
+        messages, max_tokens = build_messages(question, remaining, persona, answer_length, table_format)
+        prompt_tokens = generator.count_tokens(messages[0]["content"] + "\n" + messages[1]["content"])
+        if prompt_tokens + max_tokens + safety_margin_tokens <= n_ctx:
+            return messages, max_tokens, remaining, dropped
+        if not remaining:
+            # Even the system prompt + zero evidence + max_tokens doesn't
+            # fit — this is a genuine capacity problem (n_ctx too small
+            # for this persona/answer_length combination even with no
+            # evidence at all), not something more dropping can fix.
+            # Surface it as an exception rather than silently returning
+            # an empty-evidence answer that would look like "insufficient
+            # evidence" for the wrong reason.
+            raise ContextBudgetError(
+                f"Prompt does not fit within n_ctx={n_ctx} even with zero "
+                f"evidence chunks (prompt_tokens={prompt_tokens}, "
+                f"max_tokens={max_tokens}, safety_margin={safety_margin_tokens}). "
+                f"Reduce answer_length, increase n_ctx, or shorten the "
+                f"system/persona prompt."
+            )
+        remaining = remaining[:-1]  # drop the least-relevant (last) candidate
+        dropped += 1
+
+
+class ContextBudgetError(Exception):
+    pass
 
 
 _CITATION_RE = re.compile(r"\[(CMT-RAG-\d{6})\]")
@@ -182,6 +262,17 @@ class Generator(ABC):
     @abstractmethod
     def generate(self, messages: list[dict], max_tokens: int) -> str: ...
 
+    @abstractmethod
+    def count_tokens(self, text: str) -> int:
+        """Real token count for THIS model's actual vocabulary — the
+        thing a character-based budget can only ever approximate. Added
+        specifically to fix a real deployment's
+        'Requested tokens (16023) exceed context window of 4096' crash:
+        the fix needs to measure tokens, not guess from character count,
+        and this is the one place in the codebase that has direct access
+        to the model's tokenizer."""
+        ...
+
 
 class LlamaCppGenerator(Generator):
     def __init__(self, model_path: str, n_ctx: int, n_threads: int):
@@ -201,6 +292,22 @@ class LlamaCppGenerator(Generator):
     def generate(self, messages: list[dict], max_tokens: int) -> str:
         output = self._llm.create_chat_completion(messages=messages, max_tokens=max_tokens, temperature=0.0)
         return output["choices"][0]["message"]["content"].strip()
+
+    def count_tokens(self, text: str) -> int:
+        # llama_cpp.Llama.tokenize() is the model's REAL tokenizer — this
+        # is authoritative, not an estimate. add_bos=False because we're
+        # measuring a substring of a larger chat-templated prompt, not a
+        # full standalone sequence; special=True lets it count any
+        # special/control tokens present in the text itself (harmless if
+        # there are none). NOTE: this measures the raw message text, not
+        # the fully chat-templated prompt llama.cpp actually builds
+        # internally for create_chat_completion() (which adds role
+        # markers/special tokens on top) — that overhead is typically
+        # small (tens of tokens) relative to n_ctx=4096, which is why
+        # config.CONTEXT_SAFETY_MARGIN_TOKENS exists as a buffer for
+        # exactly this gap, rather than trying to replicate llama.cpp's
+        # internal chat template here.
+        return len(self._llm.tokenize(text.encode("utf-8"), add_bos=False, special=True))
 
 
 class MockGroundedGenerator(Generator):
@@ -226,6 +333,15 @@ class MockGroundedGenerator(Generator):
         if not out:
             return "I cannot find the answer in the provided documents."
         return " ".join(out)
+
+    def count_tokens(self, text: str) -> int:
+        # Rough approximation ONLY (chars/4) — there is no real tokenizer
+        # behind this generator. Fine for testing the TRIMMING LOOP's
+        # logic (fit_candidates_to_token_budget in this module), which is
+        # what tests/test_context_budget.py actually exercises; this
+        # number must never be treated as representative of the real
+        # model's token counts.
+        return max(1, len(text) // 4)
 
 
 def get_generator(backend: str, **kwargs) -> Generator:
