@@ -23,6 +23,12 @@ GGUF_MODEL_PATH = os.environ.get(
     "RAG_GGUF_MODEL_PATH", "./models/qwen2.5-1.5b-instruct-q4_k_m.gguf"
 )
 N_CTX = int(os.environ.get("RAG_N_CTX", "4096"))
+# Reserved headroom below N_CTX for: the model's own chat-template
+# overhead (role markers/special tokens llama.cpp adds beyond the raw
+# message text), and to avoid landing EXACTLY at the boundary. This is
+# on top of max_tokens (the requested completion length) — the real
+# check is prompt_tokens + max_tokens + this margin <= N_CTX.
+CONTEXT_SAFETY_MARGIN_TOKENS = int(os.environ.get("RAG_CONTEXT_SAFETY_MARGIN_TOKENS", "128"))
 N_THREADS = int(os.environ.get("RAG_N_THREADS", str(os.cpu_count() or 4)))
 
 RAG_API_KEY = os.environ.get("RAG_API_KEY", "").strip()
@@ -56,6 +62,27 @@ CONTEXT_CHARS_PER_CHUNK = int(os.environ.get("RAG_CONTEXT_CHARS_PER_CHUNK", "120
 WEIGHT_SEMANTIC = float(os.environ.get("RAG_WEIGHT_SEMANTIC", "0.55"))
 WEIGHT_LEXICAL = float(os.environ.get("RAG_WEIGHT_LEXICAL", "0.30"))
 WEIGHT_METADATA = float(os.environ.get("RAG_WEIGHT_METADATA", "0.15"))
+
+# Lexical score saturation divisor (used to squash a backend's raw
+# lexical score into 0..1 before blending into `confidence` — see
+# retrieval.py's rerank()/assess_evidence_sufficiency()). THIS IS
+# BACKEND-DEPENDENT and was a real bug: it was hardcoded to 5.0,
+# calibrated against SQLite FTS5's bm25()-derived score (typically
+# single digits for a strong match). Postgres's ts_rank_cd() lives on a
+# completely different scale (typically well under 1.0 even for a
+# strong match), so the same /5.0 divisor made the lexical signal
+# contribute almost nothing to `confidence` on Postgres specifically —
+# which, combined with a near-zero semantic contribution whenever the
+# vector store is empty/mismatched, was enough to push otherwise-good
+# evidence below EVIDENCE_SCORE_FLOOR. The Postgres default below is a
+# reasoned STARTING POINT (ts_rank_cd for a solid plainto_tsquery match
+# is commonly in the ~0.1-0.6 range), not empirically calibrated against
+# a live Postgres instance — benchmark against your real corpus and tune
+# via RAG_LEXICAL_SATURATION if scores still look off.
+LEXICAL_SATURATION = float(os.environ.get(
+    "RAG_LEXICAL_SATURATION",
+    "5.0" if os.environ.get("RAG_DB_BACKEND", "sqlite") == "sqlite" else "0.5",
+))
 
 # Evidence sufficiency gate (section 13). If the best reranked score for the
 # top chunk is below this, or too few candidates clear a floor score, the
