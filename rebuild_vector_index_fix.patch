@@ -1,0 +1,376 @@
+diff --git a/ingestion_pipeline.py b/ingestion_pipeline.py
+index 19413a1..6637c8a 100644
+--- a/ingestion_pipeline.py
++++ b/ingestion_pipeline.py
+@@ -269,14 +269,45 @@ def remove_document(db: DBBackend, document_id: str, actor: str) -> DocumentReco
+     return db.transition_document_state(document_id, IngestionState.REMOVED, actor=actor)
+ 
+ 
+-def rebuild_vector_index(db: DBBackend, embedder: EmbeddingBackend, vector_store_factory, path: str):
++class RebuildVerificationError(Exception):
++    """Raised when a rebuilt vector store's count doesn't match the
++    active-chunk count — the live store is NEVER touched when this is
++    raised (see rebuild_vector_index())."""
++
++
++def rebuild_vector_index(db: DBBackend, embedder: EmbeddingBackend, vector_store_factory, path: str) -> VectorStore:
+     """Physical index cleanup (section G: 'eventual physical index cleanup
+     /rebuild'). Re-embeds and re-adds only the chunks belonging to
+-    currently-INDEXED documents into a *fresh* vector store at `path`,
+-    so REMOVED documents' vectors are actually dropped from disk rather
+-    than merely filtered at query time. This is an explicit maintenance
+-    operation (run during a maintenance window), not something that runs
+-    on every removal — removal correctness does not depend on it running.
++    currently-INDEXED documents, into a genuinely fresh store, then
++    atomically replaces the live store at `path` only after verifying
++    the count is correct.
++
++    FIXED (previously a real, shipped bug): this used to call
++    `vector_store_factory(path, dim)` directly on the LIVE path. Both
++    NumpyVectorStore and FaissVectorStore load whatever's already on
++    disk at a given path if it exists (that's the correct behavior for
++    normal startup — main.py relies on it) — so calling the factory on
++    the live path here loaded the OLD, stale vectors, and the subsequent
++    `.add()` appended the freshly re-embedded active chunks ON TOP of
++    them rather than replacing them. Confirmed in production: a 360-
++    vector stale store + 197 active chunks produced 557, not 197.
++
++    The fix builds into an isolated temporary directory (never a bare
++    `path + suffix` string — Path.with_suffix() only looks at text after
++    the LAST dot, so a naive `f"{path}.rebuild-{uuid}"` collapses back to
++    the exact same `.faiss` filename as the live index once
++    FaissVectorStore derives its on-disk name; verified this collision
++    empirically before writing this fix). Only after the temp build's
++    vector count is verified against the active-chunk count does this
++    function touch the live path at all, and it does so by moving each
++    companion file (both from the same successful temp build, so a
++    `.faiss`/`.idmap.json` pair — or `.ids.json`/`.vecs.npy` pair for the
++    numpy backend — always corresponds to the same build) into place
++    with `os.replace()`, which is atomic per-file on POSIX filesystems.
++
++    Raises RebuildVerificationError (leaving the live store completely
++    untouched, and cleaning up its own temp files) if the count doesn't
++    match — this is a correctness check, not best-effort.
+     """
+     active_chunk_ids = db.get_active_chunk_ids()
+     texts, ids = [], []
+@@ -285,8 +316,43 @@ def rebuild_vector_index(db: DBBackend, embedder: EmbeddingBackend, vector_store
+             if chunk.chunk_id in active_chunk_ids:
+                 texts.append(chunk.content)
+                 ids.append(chunk.chunk_id)
+-    fresh_store = vector_store_factory(path, embedder.dim)
++    expected_count = len(set(ids))
++
++    # Isolated temp directory, not a suffixed path string — see the
++    # collision note in the docstring above.
++    temp_dir = Path(path).parent / f".rebuild-{uuid.uuid4().hex}"
++    temp_path = str(temp_dir / Path(path).name)
++
++    temp_store = vector_store_factory(temp_path, embedder.dim)
+     if texts:
+         vectors = embedder.embed(texts)
+-        fresh_store.add(ids, vectors)
+-    return fresh_store
++        temp_store.add(ids, vectors)
++
++    actual_count = temp_store.size()
++    if actual_count != expected_count:
++        shutil.rmtree(temp_dir, ignore_errors=True)
++        raise RebuildVerificationError(
++            f"Rebuilt vector count ({actual_count}) does not match the "
++            f"active chunk count ({expected_count}). The live vector "
++            f"store at '{path}' was NOT modified. Temporary build files "
++            f"have been removed."
++        )
++
++    # Only now touch the live path. `live_probe` is instantiated ONLY to
++    # ask it where its own files live (storage_paths() is pure path
++    # derivation, no disk write) — it is never .add()'d or persisted, so
++    # constructing it (which may load the OLD stale data into memory) is
++    # safe; that in-memory data is discarded, never written back.
++    live_probe = vector_store_factory(path, embedder.dim)
++    live_paths = live_probe.storage_paths()
++    del live_probe
++    temp_paths = temp_store.storage_paths()
++
++    for src, dst in zip(temp_paths, live_paths):
++        dst.parent.mkdir(parents=True, exist_ok=True)
++        os.replace(src, dst)  # atomic per-file on POSIX
++
++    shutil.rmtree(temp_dir, ignore_errors=True)  # temp dir itself, now empty
++
++    # Fresh handle that re-reads the files we just swapped in.
++    return vector_store_factory(path, embedder.dim)
+diff --git a/tests/test_rebuild_vector_index.py b/tests/test_rebuild_vector_index.py
+new file mode 100644
+index 0000000..fbb7c1f
+--- /dev/null
++++ b/tests/test_rebuild_vector_index.py
+@@ -0,0 +1,204 @@
++"""
++tests/test_rebuild_vector_index.py
++--------------------------------------
++Regression test for a real production bug: `rebuild_vector_index()`
++pointed at an already-populated vector store path appended freshly
++re-embedded active-chunk vectors ON TOP of the stale ones already there,
++because both NumpyVectorStore/FaissVectorStore load existing data on
++construction (correct behavior for normal startup) and the old
++implementation called the factory directly on the LIVE path. Confirmed
++in production: 360 stale + 197 active = 557, not 197.
++
++This test reproduces the same shape of bug with small numbers (fast,
++deterministic) and confirms the fix produces exactly the active count,
++never the sum.
++
++Run with: python3 tests/test_rebuild_vector_index.py
++"""
++
++import os
++import sys
++import shutil
++import tempfile
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++
++from db import SqliteBackend
++from embeddings import HashingTfidfEmbeddings
++from vector_store import NumpyVectorStore, get_vector_store
++from ingestion_pipeline import (
++    IngestionInput, ingest_document, remove_document,
++    rebuild_vector_index, RebuildVerificationError,
++)
++
++
++def _fresh_env():
++    tmpdir = tempfile.mkdtemp(prefix="cmt_veda_rebuild_test_")
++    db = SqliteBackend(os.path.join(tmpdir, "test.db"))
++    embedder = HashingTfidfEmbeddings(n_features=256)
++    store_path = os.path.join(tmpdir, "vs", "store")
++    vs = NumpyVectorStore(store_path, dim=256)
++    return tmpdir, store_path, db, embedder, vs
++
++
++def test_rebuild_does_not_append_onto_stale_store():
++    """The exact reported bug, reproduced: a stale store with vectors
++    from since-removed documents, rebuilt in place, must end up with
++    EXACTLY the active-chunk count — not the stale count plus the active
++    count."""
++    tmpdir, store_path, db, embedder, vs = _fresh_env()
++    try:
++        docs = []
++        for i in range(5):
++            doc = ingest_document(db, embedder, vs, IngestionInput(
++                raw_text=f"Abstract\nDocument number {i} discussing CMT topic {i}. " * 6,
++                title=f"Doc {i}",
++            ), actor="test")
++            docs.append(doc)
++
++        stale_physical_count = vs.size()
++        assert stale_physical_count == 5
++
++        # Remove 2 of the 5 -- simulating documents superseded/removed
++        # since the store was last rebuilt.
++        remove_document(db, docs[0].document_id, actor="test")
++        remove_document(db, docs[1].document_id, actor="test")
++
++        active_count = len(db.get_active_chunk_ids())
++        assert active_count == 3
++        # The physical store is untouched by removal alone (expected --
++        # removal correctness comes from the DB-authoritative active
++        # filter at query time, not from mutating the vector store).
++        assert vs.size() == 5
++
++        # This is the exact call the production container ran.
++        rebuilt = rebuild_vector_index(
++            db, embedder, lambda p, d: get_vector_store("numpy", p, d), store_path,
++        )
++
++        print(f"stale_physical_count={stale_physical_count}, active_count={active_count}, "
++              f"rebuilt.size()={rebuilt.size()}")
++        assert rebuilt.size() == active_count, (
++            f"BUG STILL PRESENT: expected exactly {active_count} (the active count), "
++            f"got {rebuilt.size()} (stale {stale_physical_count} + active {active_count} "
++            f"= {stale_physical_count + active_count} would indicate the append bug)"
++        )
++
++        # Confirm this holds against a COMPLETELY FRESH handle re-reading
++        # the files from disk too, not just the in-memory object the
++        # function happened to return.
++        reopened = NumpyVectorStore(store_path, dim=256)
++        assert reopened.size() == active_count
++        print(f"Rebuild produced exactly {active_count} vectors (not "
++              f"{stale_physical_count + active_count}) — confirmed both via the "
++              f"returned handle and a fresh re-read from disk: PASS")
++
++        # No leftover temp directories.
++        leftover = [p for p in os.listdir(os.path.dirname(store_path)) if p.startswith(".rebuild-")]
++        assert not leftover, f"temp rebuild directory not cleaned up: {leftover}"
++        print("No leftover temp rebuild directories: PASS")
++    finally:
++        db.close()
++        shutil.rmtree(tmpdir, ignore_errors=True)
++
++
++def test_rebuild_with_no_prior_store_still_correct():
++    """Sanity check: rebuilding when there was never a store at that path
++    at all (first-ever rebuild) still produces exactly the active count."""
++    tmpdir, store_path, db, embedder, vs = _fresh_env()
++    try:
++        for i in range(4):
++            ingest_document(db, embedder, vs, IngestionInput(
++                raw_text=f"Abstract\nDocument {i} about CMT. " * 6, title=f"D{i}",
++            ), actor="test")
++
++        fresh_store_path = os.path.join(tmpdir, "never_existed_before", "store")
++        rebuilt = rebuild_vector_index(
++            db, embedder, lambda p, d: get_vector_store("numpy", p, d), fresh_store_path,
++        )
++        assert rebuilt.size() == 4
++        print("Rebuild with no prior store at the path: correct count: PASS")
++    finally:
++        db.close()
++        shutil.rmtree(tmpdir, ignore_errors=True)
++
++
++def test_rebuild_verification_failure_leaves_live_store_untouched():
++    """If the rebuilt count somehow doesn't match the active count, the
++    live store must be left completely alone and the temp files cleaned
++    up -- this is a hard correctness gate, not best-effort."""
++    tmpdir, store_path, db, embedder, vs = _fresh_env()
++    try:
++        ingest_document(db, embedder, vs, IngestionInput(
++            raw_text="Abstract\nSome CMT content here. " * 6, title="D0",
++        ), actor="test")
++        original_live_size = vs.size()
++
++        class LyingVectorStore(NumpyVectorStore):
++            """Test double: claims a different size than it actually has,
++            to exercise the verification-failure path deterministically."""
++            def size(self):
++                return super().size() + 999  # deliberately wrong
++
++        def lying_factory(p, d):
++            return LyingVectorStore(p, d)
++
++        try:
++            rebuild_vector_index(db, embedder, lying_factory, store_path)
++            raise AssertionError("expected RebuildVerificationError")
++        except RebuildVerificationError as e:
++            print(f"Correctly raised RebuildVerificationError: {e}")
++
++        # Live store completely untouched.
++        reopened = NumpyVectorStore(store_path, dim=256)
++        assert reopened.size() == original_live_size
++        print(f"Live store unchanged after a failed verification "
++              f"(still {original_live_size}): PASS")
++
++        # No leftover temp directory from the failed attempt.
++        leftover = [p for p in os.listdir(os.path.dirname(store_path)) if p.startswith(".rebuild-")]
++        assert not leftover, f"temp directory not cleaned up after failure: {leftover}"
++        print("Temp files cleaned up after a failed verification: PASS")
++    finally:
++        db.close()
++        shutil.rmtree(tmpdir, ignore_errors=True)
++
++
++def test_faiss_style_suffix_collision_is_actually_avoided():
++    """Direct, isolated check of the path-construction bug described in
++    rebuild_vector_index()'s docstring: a naive `f"{path}.rebuild-{uuid}"`
++    temp name collapses back to the SAME filename as the live path once
++    Path.with_suffix('.faiss') is applied (it only looks at text after
++    the last dot). The fix must put the unique token in a directory
++    component instead."""
++    from pathlib import Path
++    import uuid
++
++    path = "runtime/faiss_index"
++
++    naive_temp = f"{path}.rebuild-{uuid.uuid4().hex}"
++    naive_collides = Path(naive_temp).with_suffix(".faiss") == Path(path).with_suffix(".faiss")
++    assert naive_collides, "this test's premise (the naive approach collides) no longer holds — re-check pathlib behavior"
++
++    temp_dir = Path(path).parent / f".rebuild-{uuid.uuid4().hex}"
++    fixed_temp = str(temp_dir / Path(path).name)
++    fixed_distinct = Path(fixed_temp).with_suffix(".faiss") != Path(path).with_suffix(".faiss")
++    assert fixed_distinct
++
++    print("Confirmed: naive suffix-based temp naming collides with the live "
++          "filename; the directory-based approach used in the fix does not: PASS")
++
++
++if __name__ == "__main__":
++    tests = [v for k, v in list(globals().items()) if k.startswith("test_")]
++    failures = 0
++    for t in tests:
++        print(f"\n--- {t.__name__} ---")
++        try:
++            t()
++        except Exception as e:
++            failures += 1
++            print(f"FAIL: {t.__name__}: {e}")
++    print(f"\n{len(tests) - failures}/{len(tests)} passed")
++    if failures:
++        sys.exit(1)
+diff --git a/vector_store.py b/vector_store.py
+index 9c30859..71cabd2 100644
+--- a/vector_store.py
++++ b/vector_store.py
+@@ -50,6 +50,16 @@ class VectorStore(ABC):
+     @abstractmethod
+     def size(self) -> int: ...
+ 
++    @abstractmethod
++    def storage_paths(self) -> list[Path]:
++        """The on-disk file(s) this store persists to, derived purely
++        from `self.path` (no disk access) — safe to call on any instance,
++        including one pointed at a path that doesn't exist yet. Exists
++        so a caller (ingestion_pipeline.rebuild_vector_index) can
++        atomically swap a verified rebuild into place file-by-file
++        without hardcoding or guessing each backend's naming scheme."""
++        ...
++
+ 
+ class NumpyVectorStore(VectorStore):
+     def __init__(self, path: str, dim: int):
+@@ -102,6 +112,9 @@ class NumpyVectorStore(VectorStore):
+     def size(self) -> int:
+         return len(self.ids)
+ 
++    def storage_paths(self) -> list[Path]:
++        return [self._ids_path, self._vecs_path]
++
+ 
+ class FaissVectorStore(VectorStore):
+     """Real production vector store. Requires `faiss`, not installed in
+@@ -119,9 +132,9 @@ class FaissVectorStore(VectorStore):
+         self._faiss = faiss
+         self.path = Path(path)
+         self.dim = dim
+-        index_file = self.path.with_suffix(".faiss")
+-        if index_file.exists():
+-            self._index = faiss.read_index(str(index_file))
++        self._index_path = self.path.with_suffix(".faiss")
++        if self._index_path.exists():
++            self._index = faiss.read_index(str(self._index_path))
+         else:
+             base = faiss.IndexFlatIP(dim)  # inner product on normalized vectors == cosine
+             self._index = faiss.IndexIDMap2(base)
+@@ -135,7 +148,7 @@ class FaissVectorStore(VectorStore):
+ 
+     def _persist(self):
+         self.path.parent.mkdir(parents=True, exist_ok=True)
+-        self._faiss.write_index(self._index, str(self.path.with_suffix(".faiss")))
++        self._faiss.write_index(self._index, str(self._index_path))
+         self._id_map_path.write_text(json.dumps({
+             "str_to_int": self._str_to_int, "int_to_str": self._int_to_str,
+         }))
+@@ -169,6 +182,9 @@ class FaissVectorStore(VectorStore):
+     def size(self) -> int:
+         return self._index.ntotal
+ 
++    def storage_paths(self) -> list[Path]:
++        return [self._index_path, self._id_map_path]
++
+ 
+ def get_vector_store(backend: str, path: str, dim: int) -> VectorStore:
+     if backend == "numpy":
