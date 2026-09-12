@@ -63,8 +63,8 @@ from db import get_backend
 from embeddings import get_embedding_backend
 from vector_store import get_vector_store
 from retrieval import HybridRetriever, assess_evidence_sufficiency
-from generation import build_messages, validate_citations, get_generator
-from config import Persona, INSUFFICIENT_EVIDENCE_MESSAGE
+from generation import build_messages, validate_citations, get_generator, fit_candidates_to_token_budget, ContextBudgetError
+from config import Persona, INSUFFICIENT_EVIDENCE_MESSAGE, CONTEXT_SAFETY_MARGIN_TOKENS
 
 MANDATORY_QUESTIONS = [
     "What is Charcot-Marie-Tooth disease?",
@@ -86,19 +86,66 @@ NARROW_MECHANISM_TERMS = ["sh3tc2", "hdac6", "aggresome", "autophagy", "cmt4c"]
 GENERAL_CMT_QUESTION = "What is Charcot-Marie-Tooth disease?"
 
 
-def run_one(retriever, generator, question: str, persona: Persona, answer_length="detailed", table_format="auto"):
+def run_one(retriever, generator, question: str, persona: Persona, n_ctx: int,
+            answer_length="detailed", table_format="auto", verbose=True):
+    candidate_pool = retriever.retrieve(question)  # RAW pool, pre-rerank/diversify
     ranked, scope, ents = retriever.retrieve_and_rank(question)
     assessment = assess_evidence_sufficiency(ranked, question=question)
+
+    diag = {
+        "retrieved_candidate_count": len(candidate_pool),
+        "final_candidate_count": len(ranked),
+        "scope": scope,
+        "sufficient": assessment.sufficient,
+        "supporting_chunk_source_ids": [c.source_id for c in assessment.supporting_chunks],
+    }
+    if verbose:
+        print(f"  [diag] retrieved={diag['retrieved_candidate_count']} "
+              f"final={diag['final_candidate_count']} scope={scope} "
+              f"sufficient={assessment.sufficient} "
+              f"supporting_sources={diag['supporting_chunk_source_ids']}")
 
     if not assessment.sufficient:
         return {
             "question": question, "persona": persona.value, "scope": scope,
             "insufficient_evidence": True, "answer": INSUFFICIENT_EVIDENCE_MESSAGE,
-            "cited_source_ids": [], "dropped_unsupported_citations": [],
+            "cited_source_ids": [], "dropped_unsupported_citations": [], "diagnostics": diag,
         }
 
     final = assessment.supporting_chunks
-    messages, max_tokens = build_messages(question, final, persona, answer_length, table_format)
+
+    # Token-based context fit — NOT a character-based guess. This is the
+    # authoritative answer to "does the resulting llama.cpp request fit
+    # within n_ctx": measured with the model's real tokenizer, not
+    # estimated. See generation.py's fit_candidates_to_token_budget
+    # docstring for the full diagnosis of why the original
+    # "Requested tokens (16023) exceed context window of 4096" crash
+    # happened (CONTEXT_CHARS_PER_CHUNK was declared but never applied).
+    try:
+        messages, max_tokens, final, dropped = fit_candidates_to_token_budget(
+            question, final, persona, answer_length, table_format,
+            generator, n_ctx=n_ctx, safety_margin_tokens=CONTEXT_SAFETY_MARGIN_TOKENS,
+        )
+    except ContextBudgetError as e:
+        diag["context_budget_error"] = str(e)
+        if verbose:
+            print(f"  [diag] CONTEXT BUDGET ERROR: {e}")
+        return {
+            "question": question, "persona": persona.value, "scope": scope,
+            "insufficient_evidence": True, "answer": INSUFFICIENT_EVIDENCE_MESSAGE,
+            "cited_source_ids": [], "dropped_unsupported_citations": [], "diagnostics": diag,
+        }
+
+    prompt_tokens = generator.count_tokens(messages[0]["content"] + "\n" + messages[1]["content"])
+    diag.update({
+        "prompt_tokens": prompt_tokens, "requested_output_tokens": max_tokens,
+        "n_ctx": n_ctx, "fits_within_n_ctx": prompt_tokens + max_tokens + CONTEXT_SAFETY_MARGIN_TOKENS <= n_ctx,
+        "candidates_dropped_for_context_fit": dropped,
+    })
+    if verbose:
+        print(f"  [diag] prompt_tokens={prompt_tokens} requested_output_tokens={max_tokens} "
+              f"n_ctx={n_ctx} fits={diag['fits_within_n_ctx']} dropped_for_fit={dropped}")
+
     raw_answer = generator.generate(messages, max_tokens)
     retrieved_ids = {c.source_id for c in final}
     validated = validate_citations(raw_answer, retrieved_ids)
@@ -108,6 +155,7 @@ def run_one(retriever, generator, question: str, persona: Persona, answer_length
         "insufficient_evidence": False, "answer": validated.text,
         "cited_source_ids": validated.cited_source_ids,
         "dropped_unsupported_citations": validated.dropped_unsupported_citations,
+        "diagnostics": diag,
     }
 
 
@@ -137,7 +185,7 @@ def main():
     print("=== Mandatory questions x 3 personas ===")
     for q in MANDATORY_QUESTIONS:
         for persona in (Persona.STUDENT, Persona.CLINICIAN, Persona.RESEARCHER):
-            r = run_one(retriever, generator, q, persona)
+            r = run_one(retriever, generator, q, persona, n_ctx=args.n_ctx)
             report["results"].append(r)
             print(f"\n[{persona.value}] {q}")
             print(f"  {r['answer'][:300]}{'...' if len(r['answer']) > 300 else ''}")
@@ -163,7 +211,7 @@ def main():
 
     print(f"\n=== Deliberately unsupported question ===")
     for persona in (Persona.STUDENT, Persona.CLINICIAN, Persona.RESEARCHER):
-        r = run_one(retriever, generator, args.unsupported_question, persona)
+        r = run_one(retriever, generator, args.unsupported_question, persona, n_ctx=args.n_ctx)
         report["results"].append(r)
         refused = r["insufficient_evidence"] or INSUFFICIENT_EVIDENCE_MESSAGE.lower() in r["answer"].lower()
         print(f"  [{persona.value}] refused correctly: {refused}")
