@@ -39,6 +39,9 @@ those three are available in this environment.
 Any format other than text/markdown/pdf is explicitly rejected rather
 than silently mis-parsed, per section E.
 """
+import os
+import shutil
+from pathlib import Path
 
 import uuid
 from dataclasses import dataclass, field
