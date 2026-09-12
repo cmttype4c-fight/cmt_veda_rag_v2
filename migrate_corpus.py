@@ -89,13 +89,15 @@ def build_ingestion_input(path: Path, metadata: dict, knowledge_version: str) ->
     if ext in PDF_EXTENSIONS:
         return IngestionInput(
             raw_bytes=path.read_bytes(), format="pdf", title=title,
-            ingestion_method="manual_upload", **{k: v for k, v in meta.items() if v},
+            ingestion_method="manual_upload", knowledge_version=knowledge_version,
+            **{k: v for k, v in meta.items() if v},
         )
     elif ext in TEXT_EXTENSIONS:
         return IngestionInput(
             raw_text=path.read_text(encoding="utf-8", errors="replace"),
             format="markdown" if ext == ".md" else "text", title=title,
-            ingestion_method="manual_upload", **{k: v for k, v in meta.items() if v},
+            ingestion_method="manual_upload", knowledge_version=knowledge_version,
+            **{k: v for k, v in meta.items() if v},
         )
     else:
         raise IngestionValidationError(f"Unsupported file extension '{ext}' for {path.name}")
