@@ -85,6 +85,14 @@ class IngestionInput:
     source_url: str = ""
     discovery_candidate_id: Optional[str] = None
     ingestion_method: str = "manual_upload"
+    # Was missing entirely — DocumentRecord has always had a
+    # knowledge_version column, but nothing on the ingestion input side
+    # ever set it, so every document ended up with knowledge_version=None
+    # regardless of what a migration run's --knowledge-version said.
+    # Found via a real deployment (Platform 1 hit this independently and
+    # patched it locally); fixed here in the source of truth instead of
+    # leaving the canonical repo behind a field deployment's hotfix.
+    knowledge_version: Optional[str] = None
 
 
 def _validate_pdf_bytes(data: Optional[bytes]) -> None:
@@ -105,7 +113,14 @@ def extract_text_from_pdf_bytes(data: bytes) -> str:
     """Real PDF text extraction using pypdf. Tested this session against a
     reportlab-generated PDF end-to-end through the full ingestion
     pipeline (see module docstring for the fidelity caveat against real
-    publisher-formatted PDFs)."""
+    publisher-formatted PDFs).
+
+    Strips NUL characters (\\x00): a real deployment hit `page.extract_text()`
+    returning embedded NUL bytes for at least one real-corpus PDF, which
+    breaks Postgres (its TEXT type rejects \\x00 outright) and is
+    generally a sign of a PDF with unusual internal encoding. Stripping
+    is a safe, minimal fix — it doesn't change any real character content,
+    only removes bytes that can never be valid text content anyway."""
     import io
     from pypdf import PdfReader
     reader = PdfReader(io.BytesIO(data))
@@ -113,7 +128,7 @@ def extract_text_from_pdf_bytes(data: bytes) -> str:
         raise IngestionValidationError(
             f"PDF has {len(reader.pages)} pages, exceeding the {MAX_PDF_PAGES}-page limit — rejecting."
         )
-    return "\n\n".join(page.extract_text() or "" for page in reader.pages)
+    return "\n\n".join(page.extract_text() or "" for page in reader.pages).replace("\x00", "")
 
 
 def _extract_text(payload: IngestionInput) -> str:
@@ -206,6 +221,7 @@ def ingest_document(
         discovery_candidate_id=payload.discovery_candidate_id,
         ingestion_method=payload.ingestion_method,
         approval_status=IngestionState.DISCOVERED,
+        knowledge_version=payload.knowledge_version,
     )
     db.create_document(doc)
     db.transition_document_state(document_id, IngestionState.PENDING_APPROVAL, actor="system")
