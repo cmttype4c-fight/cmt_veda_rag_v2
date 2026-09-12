@@ -434,3 +434,159 @@ objects (title/authors/DOI/etc.) — kept simple deliberately rather than
 adding a source_id-to-document lookup that doesn't exist elsewhere in
 this codebase; if rich resumed-source display matters, that's a
 follow-up, not silently assumed to already work.
+
+---
+
+## Round 6: VPS deployment diagnosis (Platform 1 response)
+
+Direct response to a real deployment report: model loaded successfully,
+but every basic question returned "insufficient evidence," and
+validation then crashed with `ValueError: Requested tokens (16023)
+exceed context window of 4096`. Found and fixed 5 real bugs; one
+character-based stopgap (`CONTEXT_MAX_CHARS`) is explicitly replaced
+with a token-based mechanism per the direct question asked.
+
+### Bugs found and fixed
+
+1. **`CONTEXT_CHARS_PER_CHUNK` was declared in `config.py` but never
+   referenced in `generation.py`.** Confirmed with `grep` before touching
+   anything — zero usages. Every candidate's full chunk text (up to
+   1800 chars from `ingestion.py`'s chunker) was going into the prompt
+   uncapped, across up to 12 chunks. This is the single largest
+   contributor to the reported token overflow. Fixed: now applied as a
+   cheap per-chunk cap in `build_messages()`.
+
+2. **The real fix for the crash is token-based, not character-based** —
+   directly answering the question asked ("whether the 8000-character
+   context budget is the correct fix or whether the repository should
+   instead calculate a token-based prompt budget"). Character-to-token
+   ratio is not fixed: gene symbols, HGVS mutation notation
+   ("p.Arg1109X"), and any residual PDF-extraction noise all tokenize
+   worse than plain English prose, so no fixed character number is ever
+   safe. Added `Generator.count_tokens()` (real tokenizer via
+   `Llama.tokenize()` for the production model) and
+   `fit_candidates_to_token_budget()` in `generation.py`, which drops
+   least-relevant candidates one at a time until the prompt ACTUALLY fits
+   `n_ctx` (measured, not estimated), then raises `ContextBudgetError`
+   (rather than silently guessing) if even zero evidence doesn't fit.
+   Wired into `main.py`'s `ask()` and `scripts/run_qwen_validation.py`.
+   Tested for real (mock tokenizer, since no `llama_cpp`/model here):
+   correctly drops from the least-relevant end first, correctly raises
+   on an impossible budget, correctly leaves a well-fitting prompt alone.
+
+3. **Most likely primary cause of "insufficient evidence" on every
+   basic question: vector-store/backend mismatch between migration and
+   validation.** `scripts/migrate_corpus.py` defaults to
+   `--vector-backend numpy --embedding-backend hashing_tfidf`. If the
+   real migration run didn't explicitly override BOTH to match
+   validation's `--vector-backend faiss --embedding-backend
+   sentence_transformers --vector-path /opt/cmtveda/rag-v2/runtime/
+   faiss_index`, the FAISS index at that path was never populated —
+   `FaissVectorStore.__init__` silently creates an empty index rather
+   than erroring. Semantic retrieval then returns nothing for every
+   query while Postgres still correctly reports 197 chunks — exactly
+   matching the reported symptom. **Not verified against your actual
+   deployment** (no Postgres/FAISS here) — this is a diagnosis to check,
+   not a confirmed root cause. Built `scripts/diagnose_retrieval.py`
+   specifically to check this FIRST, before running any questions:
+   `vector_store.size()` printed immediately; tested against both a
+   healthy and a deliberately-empty vector store to confirm the check
+   actually distinguishes them.
+
+4. **A second, more subtle real bug: lexical score scale mismatch
+   between SQLite FTS5 and Postgres.** The confidence-blending formula
+   divided the raw lexical score by a hardcoded `5.0`, calibrated
+   against SQLite's `bm25()` scale. Postgres's `ts_rank_cd()` lives on a
+   much smaller scale (typically well under 1.0 even for a strong
+   match), so on Postgres specifically this made the lexical signal
+   contribute almost nothing to confidence — compounding bug #3's
+   effect. Fixed with a backend-conditional config default
+   (`LEXICAL_SATURATION`, sqlite=5.0 unchanged / postgres=0.5 new),
+   overridable via `RAG_LEXICAL_SATURATION`. The Postgres value is a
+   **reasoned starting point, not empirically calibrated** — there is no
+   Postgres instance in this sandbox to verify the real `ts_rank_cd`
+   scale against; benchmark and tune against your real corpus.
+
+5. **A related SQLite-specific bug found while testing the above (does
+   NOT affect your Postgres deployment):** the SQLite FTS5 query
+   sanitizer included stopwords ("what", "is") as OR terms, and the FTS5
+   table had no stemming configured, so "supported" never matched
+   "supportive". Postgres's `ts_rank_cd`/`plainto_tsquery` with the
+   `'english'` config already does both (stopword removal AND stemming)
+   automatically — this was purely a gap in the SQLite dev/test
+   substitute's fidelity, not something present in the real deployment.
+   Fixed anyway, for correctness of this repo's own test suite: stopword
+   filtering added to `_sanitize_fts_query`, and the FTS5 table now uses
+   `tokenize = 'porter unicode61'` (SQLite's built-in Porter stemmer).
+   Fixing this uncovered that one existing test had been passing only
+   because the stopword-pollution bug was inflating its score — the test
+   corpus was enriched with more realistic document structure (matching
+   the same "make the fixture structurally realistic" pattern used
+   earlier in this project for the SH3TC2 near-miss) rather than
+   reintroducing the bug to keep the test green.
+
+### Also backported (matches fixes you'd already made independently)
+
+- **`knowledge_version` propagation**: `IngestionInput` had no such field
+  at all; `migrate_corpus.py`'s `build_ingestion_input()` accepted a
+  `knowledge_version` parameter and never used it. Every migrated
+  document silently got `knowledge_version=None` regardless of the
+  migration run's `--knowledge-version` flag. Fixed in the source of
+  truth (both `IngestionInput` and the `DocumentRecord` construction in
+  `ingest_document()`), not left as a field-only hotfix. Verified: a
+  document ingested with `knowledge_version="v2-2026-09-12"` now actually
+  carries that value.
+- **PDF NUL-character stripping**: your fix
+  (`.replace("\x00", "")`) is correct and is now in
+  `ingestion_pipeline.py`'s `extract_text_from_pdf_bytes()` directly,
+  not just in a deployed hotfix.
+
+### What this diagnosis does NOT do
+
+- **Does not weaken the evidence gate.** `EVIDENCE_SCORE_FLOOR` (0.28) is
+  untouched. Per your explicit instruction and my own read of the
+  situation: the floor isn't the bug — an empty/mismatched vector store
+  and a miscalibrated lexical-scale constant are. Once semantic
+  retrieval is actually populated, real `sentence-transformers` cosine
+  similarities for genuinely relevant passages are typically well above
+  what the toy substitute embedder in this sandbox produces, so the
+  floor should if anything become MORE easily clearable, not less —
+  monitor after the fix, don't preemptively lower it.
+- **Does not recommend a VPS upgrade.** Nothing in this diagnosis points
+  at CPU/RAM as the bottleneck. `--n-ctx 8192` (if headroom is still
+  tight after these fixes) is a software config change to `Llama()`'s
+  init parameter, not a hardware change — Qwen2.5-1.5B's KV cache at
+  8192 vs 4096 context adds a modest, bounded amount of RAM, not a
+  VPS-tier change.
+- **Does not touch Discovery Engine.** Out of scope per your instruction;
+  nothing in `discovery.py` was modified this round.
+- **Does not claim the primary hypothesis (vector-store mismatch) is
+  confirmed.** It's the most likely explanation given how
+  `migrate_corpus.py`'s defaults work, consistent with every symptom
+  reported, and directly checkable in under a minute with
+  `scripts/diagnose_retrieval.py`'s first preflight line — but it has
+  not been verified against your actual Postgres/FAISS instance, because
+  neither exists in this sandbox. Run the script; its first printed line
+  will confirm or rule this out immediately.
+
+### What to actually run, in order
+
+1. `python3 scripts/diagnose_retrieval.py --db-backend postgres
+   --postgres-dsn "$RAG_POSTGRES_DSN" --vector-path
+   /opt/cmtveda/rag-v2/runtime/faiss_index --vector-backend faiss
+   --embedding-backend sentence_transformers --model-path
+   /opt/cmtveda/rag/runtime/models/qwen2.5-1.5b-instruct-q4_k_m.gguf
+   --n-ctx 4096 --n-threads 2` — read the three preflight lines first.
+   If line 1 (`vector_store.size()`) is 0 or absurdly low relative to
+   197 chunks, that's confirmed: re-run migration with
+   `--vector-backend faiss --embedding-backend sentence_transformers
+   --vector-path /opt/cmtveda/rag-v2/runtime/faiss_index` explicitly
+   matching validation's flags exactly.
+2. Rebuild the image with this round's fixes (`generation.py`, `main.py`,
+   `retrieval.py`, `config.py`, `db.py`, `ingestion_pipeline.py`,
+   `scripts/migrate_corpus.py`, `scripts/run_qwen_validation.py`).
+3. Re-run `scripts/diagnose_retrieval.py` on the three reported
+   questions — check `sufficient=True` and `fits=True` for each before
+   re-running full validation.
+4. Re-run `run_qwen_validation.py` for the full 9-question + persona +
+   unsupported-question suite.
