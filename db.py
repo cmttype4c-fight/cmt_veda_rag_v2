@@ -994,13 +994,14 @@ class PostgresBackend(DBBackend):
             )
 
     def record_answer_audit(self, persona, query_scope, knowledge_version,
-                             retrieved_chunk_ids, cited_source_ids, insufficient_evidence) -> None:
+                            retrieved_chunk_ids, cited_source_ids, insufficient_evidence) -> None:
         with self._cursor() as cur:
             cur.execute(
                 "INSERT INTO cmt_veda_rag.answer_audit (persona, query_scope, knowledge_version,"
                 " retrieved_chunk_ids, cited_source_ids, insufficient_evidence)"
-                " VALUES (%s,%s,%s,%s,%s,%s)",
-                (persona, query_scope, knowledge_version, retrieved_chunk_ids,
+                " VALUES (%s,%s,%s,%s::uuid[],%s,%s)",
+                (persona, query_scope, knowledge_version,
+                 [str(x) for x in retrieved_chunk_ids],
                  cited_source_ids, insufficient_evidence),
             )
 
