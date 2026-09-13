@@ -168,6 +168,24 @@ class DBBackend(ABC):
 
     @abstractmethod
     def get_document_for_chunk(self, chunk_id: str) -> Optional[str]: ...
+        # -- batch fetch (performance) --
+    @abstractmethod
+    def get_document_ids_for_chunks(self, chunk_ids: list) -> dict:
+        """Returns {chunk_id: document_id} for whichever of the given
+        ids exist. Empty input returns {} without a query."""
+        ...
+
+    @abstractmethod
+    def get_chunks_by_ids(self, chunk_ids: list) -> dict:
+        """Returns {chunk_id: ChunkRecord} for whichever of the given
+        ids exist. Empty input returns {} without a query."""
+        ...
+
+    @abstractmethod
+    def get_documents_by_ids(self, document_ids: list) -> dict:
+        """Returns {document_id: DocumentRecord} for whichever of the
+        given ids exist. Empty input returns {} without a query."""
+        ...
 
     # -- discovery --
     @abstractmethod
@@ -545,6 +563,45 @@ class SqliteBackend(DBBackend):
     def get_document_for_chunk(self, chunk_id: str) -> Optional[str]:
         row = self._conn.execute("SELECT document_id FROM chunks WHERE chunk_id = ?", (chunk_id,)).fetchone()
         return row["document_id"] if row else None
+         # ---- batch fetch (performance) ----
+    def get_document_ids_for_chunks(self, chunk_ids: list) -> dict:
+        if not chunk_ids:
+            return {}
+        placeholders = ",".join("?" * len(chunk_ids))
+        rows = self._conn.execute(
+            f"SELECT chunk_id, document_id FROM chunks WHERE chunk_id IN ({placeholders})",
+            list(chunk_ids),
+        ).fetchall()
+        return {r["chunk_id"]: r["document_id"] for r in rows}
+
+    def get_chunks_by_ids(self, chunk_ids: list) -> dict:
+        if not chunk_ids:
+            return {}
+        placeholders = ",".join("?" * len(chunk_ids))
+        rows = self._conn.execute(
+            f"SELECT * FROM chunks WHERE chunk_id IN ({placeholders})",
+            list(chunk_ids),
+        ).fetchall()
+        return {
+            r["chunk_id"]: ChunkRecord(
+                chunk_id=r["chunk_id"],
+                document_id=r["document_id"],
+                section=r["section"],
+                chunk_order=r["chunk_order"],
+                content=r["content"],
+            )
+            for r in rows
+        }
+
+    def get_documents_by_ids(self, document_ids: list) -> dict:
+        if not document_ids:
+            return {}
+        placeholders = ",".join("?" * len(document_ids))
+        rows = self._conn.execute(
+            f"SELECT * FROM documents WHERE document_id IN ({placeholders})",
+            list(document_ids),
+        ).fetchall()
+        return {r["document_id"]: self._row_to_doc(r) for r in rows}
 
     # ---- discovery ----
     def create_discovery_candidate(self, discovery_candidate_id: str, proposed_title: str, proposed_source_url: str) -> None:
@@ -859,6 +916,56 @@ class PostgresBackend(DBBackend):
             cur.execute("SELECT document_id FROM cmt_veda_rag.chunks WHERE chunk_id=%s", (chunk_id,))
             row = cur.fetchone()
         return row["document_id"] if row else None
+         # ---- batch fetch (performance) ----
+    def get_document_ids_for_chunks(self, chunk_ids: list) -> dict:
+        if not chunk_ids:
+            return {}
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT chunk_id, document_id FROM cmt_veda_rag.chunks "
+                "WHERE chunk_id = ANY(%s::uuid[])",
+                ([str(x) for x in chunk_ids],),
+            )
+            rows = cur.fetchall()
+        return {str(r["chunk_id"]): str(r["document_id"]) for r in rows}
+
+    def get_chunks_by_ids(self, chunk_ids: list) -> dict:
+        if not chunk_ids:
+            return {}
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT * FROM cmt_veda_rag.chunks "
+                "WHERE chunk_id = ANY(%s::uuid[])",
+                ([str(x) for x in chunk_ids],),
+            )
+            rows = cur.fetchall()
+        return {
+            str(r["chunk_id"]): ChunkRecord(
+                chunk_id=str(r["chunk_id"]),
+                document_id=str(r["document_id"]),
+                section=r["section"],
+                chunk_order=r["chunk_order"],
+                content=r["content"],
+            )
+            for r in rows
+        }
+
+    def get_documents_by_ids(self, document_ids: list) -> dict:
+        if not document_ids:
+            return {}
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT * FROM cmt_veda_rag.documents "
+                "WHERE document_id = ANY(%s::uuid[])",
+                ([str(x) for x in document_ids],),
+            )
+            rows = cur.fetchall()
+        out = {}
+        for row in rows:
+            row = dict(row)
+            row["approval_status"] = IngestionState(row["approval_status"])
+            out[str(row["document_id"])] = DocumentRecord(**row)
+        return out
 
     def create_discovery_candidate(self, discovery_candidate_id, proposed_title, proposed_source_url) -> None:
         with self._cursor() as cur:
