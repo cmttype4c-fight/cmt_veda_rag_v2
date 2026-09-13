@@ -23,6 +23,8 @@ that already work"):
 """
 
 import logging
+import os
+import time
 import threading
 import uuid
 from pathlib import Path
@@ -80,6 +82,12 @@ async def lifespan(app: FastAPI):
 
     logger.info("Loading generation backend: %s", config.RAG_GENERATION_BACKEND)
     if config.RAG_GENERATION_BACKEND == "llama_cpp":
+        # Diagnostic-only log for performance measurement.
+        logger.info(
+            "llama_cpp config: n_ctx=%s n_threads=%s (os.cpu_count()=%s) model_path=%s",
+            config.N_CTX, config.N_THREADS, os.cpu_count(), config.GGUF_MODEL_PATH,
+        )
+
         state["generator"] = get_generator(
             "llama_cpp", model_path=config.GGUF_MODEL_PATH,
             n_ctx=config.N_CTX, n_threads=config.N_THREADS,
@@ -96,8 +104,12 @@ async def lifespan(app: FastAPI):
     all_docs = db.list_documents()
     indexed = [d for d in all_docs if d.approval_status == IngestionState.INDEXED]
     logger.info(
-        "Startup complete. %s document(s) INDEXED (of %s total). knowledge_version=%s. Ready to serve.",
+        "Startup complete. %s document(s) INDEXED (of %s total). knowledge_version=%s. "
+        "answer_length max_tokens: concise=%s detailed=%s deep=%s. Ready to serve.",
         len(indexed), len(all_docs), config.KNOWLEDGE_VERSION,
+        config.LENGTH_PRESETS["concise"]["max_tokens"],
+        config.LENGTH_PRESETS["detailed"]["max_tokens"],
+        config.LENGTH_PRESETS["deep"]["max_tokens"],
     )
     yield
     if hasattr(db, "close"):
@@ -231,6 +243,15 @@ def ask(
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
     authorization: Optional[str] = Header(default=None),
 ):
+    # Per-stage timing instrumentation.
+    # Server-side logs only; does not change the API response.
+    t_start = time.perf_counter()
+    timings = {}
+
+    def _mark(label, t_from):
+        timings[label] = time.perf_counter() - t_from
+        return time.perf_counter()
+     
     require_api_key(x_api_key, authorization)
 
     question = payload.question.strip()
@@ -245,10 +266,13 @@ def ask(
     db = state["db"]
     conversation_id = payload.conversation_id
     history = []
+    t = time.perf_counter()
     if conversation_id:
         db.create_conversation(conversation_id, persona.value, user_id=payload.user_id,
                                 title=_derive_conversation_title(question))
         history = db.get_turns(conversation_id, limit=4)
+     
+        t = _mark("history_load", t)
 
     # Query rewriting happens BEFORE retrieval and touches ONLY the
     # question that gets retrieved — never the generation prompt. See
@@ -262,9 +286,12 @@ def ask(
             logger.info("Rewrote follow-up %r -> %r (method=%s) for conversation_id=%s",
                         question, effective_question, rewrite_result.method, conversation_id)
 
+    t = _mark("rewrite", t)
     retriever: HybridRetriever = state["retriever"]
     ranked, scope, ents = retriever.retrieve_and_rank(effective_question)
+    t = _mark("retrieve", t)
     assessment = assess_evidence_sufficiency(ranked, question=effective_question)
+    t = _mark("evidence_gate", t)
 
     def _persist_turn(answer_text: str, cited_ids: list, insufficient: bool):
         if not conversation_id:
@@ -276,14 +303,41 @@ def ask(
             answer=answer_text, cited_source_ids=cited_ids,
             insufficient_evidence=insufficient,
         ))
+        
+    def _log_timing_summary(insufficient: bool, generated_tokens=None, requested_max_tokens=None,
+                             prompt_tokens=None, candidates_used=None):
+        timings["total"] = time.perf_counter() - t_start
+        logger.info(
+            "TIMING question=%r insufficient=%s scope=%s stages=%s "
+            "prompt_tokens=%s requested_max_tokens=%s generated_tokens=%s candidates_used=%s",
+            question[:80], insufficient, scope,
+            {k: round(v, 3) for k, v in timings.items()},
+            prompt_tokens, requested_max_tokens, generated_tokens, candidates_used,
+        )
 
     if not assessment.sufficient:
         logger.info("Insufficient evidence (scope=%s): %s", scope, assessment.reason)
-        db.record_answer_audit(persona.value, scope, config.KNOWLEDGE_VERSION, [], [], True)
+
+        db.record_answer_audit(
+            persona.value,
+            scope,
+            config.KNOWLEDGE_VERSION,
+            [],
+            [],
+            True,
+        )
+        t = _mark("audit_write", t)
+
         _persist_turn(INSUFFICIENT_EVIDENCE_MESSAGE, [], True)
+        t = _mark("persist_turn", t)
+
+        _log_timing_summary(insufficient=True)
+
         return AskResponse(
-            answer=INSUFFICIENT_EVIDENCE_MESSAGE, sources=[],
-            knowledge_version=config.KNOWLEDGE_VERSION, insufficient_evidence=True,
+            answer=INSUFFICIENT_EVIDENCE_MESSAGE,
+            sources=[],
+            knowledge_version=config.KNOWLEDGE_VERSION,
+            insufficient_evidence=True,
             conversation_id=conversation_id,
             rewritten_question=effective_question if effective_question != question else None,
         )
@@ -321,20 +375,56 @@ def ask(
             rewritten_question=effective_question if effective_question != question else None,
         )
 
+    t = _mark("context_fit", t)
+
+    prompt_tokens = None
+    try:
+        prompt_tokens = generator.count_tokens(
+            messages[0]["content"] + "\n" + messages[1]["content"]
+        )
+    except Exception:
+        pass
+     
     with _gen_lock:
         raw_answer = generator.generate(messages, max_tokens)
 
+    t = _mark("llm_generate", t)
+
+    generated_tokens = None
+    try:
+        generated_tokens = generator.count_tokens(raw_answer)
+    except Exception:
+        pass
+
     retrieved_ids = {c.source_id for c in final_candidates}
     validated = validate_citations(raw_answer, retrieved_ids)
+    t = _mark("citation_validate", t)
     if validated.dropped_unsupported_citations:
         logger.warning("Model cited unsupported source id(s) %s; stripped.", validated.dropped_unsupported_citations)
 
     cited_candidates = [c for c in final_candidates if c.source_id in validated.cited_source_ids] or final_candidates
     sources = [_persona_filtered_source(c, persona) for c in cited_candidates]
 
-    db.record_answer_audit(persona.value, scope, config.KNOWLEDGE_VERSION,
-                            [c.chunk_id for c in final_candidates], validated.cited_source_ids, False)
+    db.record_answer_audit(
+        persona.value,
+        scope,
+        config.KNOWLEDGE_VERSION,
+        [c.chunk_id for c in final_candidates],
+        validated.cited_source_ids,
+        False,
+    )
+    t = _mark("audit_write", t)
+
     _persist_turn(validated.text, validated.cited_source_ids, False)
+    t = _mark("persist_turn", t)
+
+    _log_timing_summary(
+        insufficient=False,
+        generated_tokens=generated_tokens,
+        requested_max_tokens=max_tokens,
+        prompt_tokens=prompt_tokens,
+        candidates_used=len(final_candidates),
+    )
 
     return AskResponse(
         answer=validated.text, sources=sources,
