@@ -358,7 +358,20 @@ class HybridRetriever:
         # _metadata_for_chunk() remains correct for other callers,
         # without generating additional DB queries.
         for document_id, doc in documents_by_id.items():
-            self._doc_metadata_cache[document_id] = self._metadata_from_doc(doc)
+            self._doc_metadata_cache[document_id] = {
+    "genes": doc.genes if doc else [],
+    "cmt_subtypes": doc.cmt_subtypes if doc else [],
+    "source_tier": doc.source_tier if doc else "unspecified",
+    "trial_id": doc.trial_id if doc else "",
+    "pmid": doc.pmid if doc else "",
+    "title": doc.title if doc else "",
+    "authors": doc.authors if doc else [],
+    "journal": doc.journal if doc else "",
+    "publication_date": doc.publication_date if doc else None,
+    "doi": doc.doi if doc else "",
+    "study_type": doc.study_type if doc else "",
+    "source_url": doc.source_url if doc else "",
+} if doc else {}
 
         candidates: dict[str, Candidate] = {}
 
@@ -375,7 +388,7 @@ class HybridRetriever:
                 section=chunk.section if chunk else "body",
                 semantic_score=float(semantic_hits.get(chunk_id, 0.0)),
                 lexical_score=float(lexical_hits.get(chunk_id, 0.0)),
-                metadata=self._metadata_from_doc(doc),
+                metadata=self._doc_metadata_cache.get(document_id, {}),
             )
 
         return list(candidates.values())[:CANDIDATE_POOL_MAX]
