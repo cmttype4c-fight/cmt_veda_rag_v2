@@ -290,45 +290,93 @@ class HybridRetriever:
 
     def retrieve(self, question: str, k: int = CANDIDATE_POOL_MAX) -> list[Candidate]:
         active_ids = self.db.get_active_chunk_ids()  # authoritative, section G
-        candidates: dict[str, Candidate] = {}
 
         # --- semantic side ---
         qvec = self.embedder.embed([question])[0]
-        for chunk_id, sim in self.vector_store.search(qvec, k=k):
-            if chunk_id not in active_ids:
-                continue  # removed/not-yet-indexed — never surfaces, no exceptions
-            document_id = self.db.get_document_for_chunk(chunk_id)
-            if document_id is None:
-                continue
-            chunk = self.db.get_chunk(chunk_id)
-            candidates[chunk_id] = Candidate(
-                chunk_id=chunk_id, document_id=document_id,
-                source_id=self.db.get_document(document_id).source_id,
-                text=chunk.content if chunk else "",
-                section=chunk.section if chunk else "body",
-                semantic_score=float(sim),
-                metadata=self._metadata_for_chunk(document_id),
-            )
+        semantic_hits = {
+            chunk_id: sim
+            for chunk_id, sim in self.vector_store.search(qvec, k=k)
+            if chunk_id in active_ids  # removed/not-yet-indexed — never surfaces
+        }
 
         # --- lexical side (already INDEXED-filtered at the SQL layer) ---
-        for chunk_id, score in self.db.lexical_search(question, limit=k):
-            if chunk_id not in active_ids:
-                continue  # defense in depth even though the SQL already filters
-            if chunk_id in candidates:
-                candidates[chunk_id].lexical_score = score
-            else:
-                document_id = self.db.get_document_for_chunk(chunk_id)
-                if document_id is None:
-                    continue
-                chunk = self.db.get_chunk(chunk_id)
-                candidates[chunk_id] = Candidate(
-                    chunk_id=chunk_id, document_id=document_id,
-                    source_id=self.db.get_document(document_id).source_id,
-                    text=chunk.content if chunk else "",
-                    section=chunk.section if chunk else "body",
-                    lexical_score=score,
-                    metadata=self._metadata_for_chunk(document_id),
-                )
+        lexical_hits = {
+            chunk_id: score
+            for chunk_id, score in self.db.lexical_search(question, limit=k)
+            if chunk_id in active_ids  # defense in depth
+        }
+
+        # PERFORMANCE FIX: batch-fetch chunk/document data instead of
+        # querying once per candidate.
+        #
+        # Ordering is deliberately preserved:
+        # 1. semantic hits in similarity-rank order
+        # 2. lexical-only hits in lexical-rank order
+        #
+        # This matches the original insertion order and therefore preserves
+        # the behavior of the final CANDIDATE_POOL_MAX truncation.
+
+        ordered_chunk_ids = list(semantic_hits.keys()) + [
+            cid for cid in lexical_hits.keys()
+            if cid not in semantic_hits
+        ]
+
+        if not ordered_chunk_ids:
+            return []
+
+        # Batch query 1: chunk -> document mapping
+        chunk_id_to_document_id = self.db.get_document_ids_for_chunks(
+            ordered_chunk_ids
+        )
+
+        surviving_chunk_ids = [
+            cid
+            for cid in ordered_chunk_ids
+            if cid in chunk_id_to_document_id
+        ]
+
+        if not surviving_chunk_ids:
+            return []
+
+        # Batch query 2: fetch all required chunks
+        chunks_by_id = self.db.get_chunks_by_ids(surviving_chunk_ids)
+
+        # Keep document order deterministic and remove duplicates
+        unique_document_ids = list(
+            dict.fromkeys(
+                chunk_id_to_document_id[cid]
+                for cid in surviving_chunk_ids
+            )
+        )
+
+        # Batch query 3: fetch all required documents
+        documents_by_id = self.db.get_documents_by_ids(
+            unique_document_ids
+        )
+
+        # Populate metadata cache from the batch result so
+        # _metadata_for_chunk() remains correct for other callers,
+        # without generating additional DB queries.
+        for document_id, doc in documents_by_id.items():
+            self._doc_metadata_cache[document_id] = self._metadata_from_doc(doc)
+
+        candidates: dict[str, Candidate] = {}
+
+        for chunk_id in surviving_chunk_ids:
+            document_id = chunk_id_to_document_id[chunk_id]
+            chunk = chunks_by_id.get(chunk_id)
+            doc = documents_by_id.get(document_id)
+
+            candidates[chunk_id] = Candidate(
+                chunk_id=chunk_id,
+                document_id=document_id,
+                source_id=doc.source_id if doc else "",
+                text=chunk.content if chunk else "",
+                section=chunk.section if chunk else "body",
+                semantic_score=float(semantic_hits.get(chunk_id, 0.0)),
+                lexical_score=float(lexical_hits.get(chunk_id, 0.0)),
+                metadata=self._metadata_from_doc(doc),
+            )
 
         return list(candidates.values())[:CANDIDATE_POOL_MAX]
 
