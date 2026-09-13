@@ -133,11 +133,11 @@ def resolve_persona(app_role: str) -> Persona:
 # ---------------------------------------------------------------------
 LENGTH_PRESETS = {
     "concise": {
-        "max_tokens": 180,
+        "max_tokens": int(os.environ.get("RAG_MAX_TOKENS_CONCISE", "180")),
         "instruction": "Answer in 2-4 concise sentences. No filler.",
     },
     "detailed": {
-        "max_tokens": 450,
+    "max_tokens": int(os.environ.get("RAG_MAX_TOKENS_DETAILED", "450")),
         "instruction": (
             "Give a genuinely explanatory answer (roughly 150-300 words). Do not "
             "pad length with restated points, and do not invent structure "
@@ -146,7 +146,7 @@ LENGTH_PRESETS = {
         ),
     },
     "deep": {
-        "max_tokens": 750,
+    "max_tokens": int(os.environ.get("RAG_MAX_TOKENS_DEEP", "750")),
         "instruction": (
             "Give a thorough, well-structured answer (multiple short paragraphs "
             "or a few labeled sections only where the evidence genuinely "
