@@ -359,19 +359,19 @@ class HybridRetriever:
         # without generating additional DB queries.
         for document_id, doc in documents_by_id.items():
             self._doc_metadata_cache[document_id] = {
-    "genes": doc.genes if doc else [],
-    "cmt_subtypes": doc.cmt_subtypes if doc else [],
-    "source_tier": doc.source_tier if doc else "unspecified",
-    "trial_id": doc.trial_id if doc else "",
-    "pmid": doc.pmid if doc else "",
-    "title": doc.title if doc else "",
-    "authors": doc.authors if doc else [],
-    "journal": doc.journal if doc else "",
-    "publication_date": doc.publication_date if doc else None,
-    "doi": doc.doi if doc else "",
-    "study_type": doc.study_type if doc else "",
-    "source_url": doc.source_url if doc else "",
-} if doc else {}
+                "genes": doc.genes if doc else [],
+                "cmt_subtypes": doc.cmt_subtypes if doc else [],
+                "source_tier": doc.source_tier if doc else "unspecified",
+                "trial_id": doc.trial_id if doc else "",
+                "pmid": doc.pmid if doc else "",
+                "title": doc.title if doc else "",
+                "authors": doc.authors if doc else [],
+                "journal": doc.journal if doc else "",
+                "publication_date": doc.publication_date if doc else None,
+                "doi": doc.doi if doc else "",
+                "study_type": doc.study_type if doc else "",
+                "source_url": doc.source_url if doc else "",
+            } if doc else {}
 
         candidates: dict[str, Candidate] = {}
 
