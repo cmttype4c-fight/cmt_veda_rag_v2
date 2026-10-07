@@ -36,7 +36,7 @@ from fastapi import FastAPI, HTTPException, Header, APIRouter, UploadFile, File,
 from pydantic import BaseModel
 
 import config
-from config import Persona, resolve_persona, IngestionState, INSUFFICIENT_EVIDENCE_MESSAGE
+from config import Persona, resolve_persona, IngestionState, INSUFFICIENT_EVIDENCE_MESSAGE, IllegalStateTransitionError
 from db import get_backend, DuplicateDocumentError, TurnRecord
 from embeddings import get_embedding_backend
 from vector_store import get_vector_store
@@ -49,6 +49,8 @@ from discovery import (
     register_candidate, approve_and_ingest, reject_candidate,
     DiscoveryCandidatePayload, DiscoveryRejectionError,
 )
+import intake
+import worker
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cmt-veda-ai")
@@ -100,6 +102,24 @@ async def lifespan(app: FastAPI):
     # loading a second model — a rewrite call and an answer-generation
     # call both go through _gen_lock so they never overlap.
     state["rewriter"] = FallbackQueryRewriter(llm_rewriter=LLMQueryRewriter(state["generator"]))
+
+    # Round 4: the intake-lifecycle async job queue (config.RAG_QUEUE_BACKEND).
+    # "redis_rq" (default, production) -- worker.enqueue_processing talks to a
+    # real Redis via RQ; its `redis`/`rq` imports are lazy (inside
+    # worker.get_redis_connection/get_queue), so picking this backend doesn't
+    # fail startup even if Redis isn't reachable yet -- it fails the first
+    # /admin/intake/*/approve call instead, which the route handlers below
+    # turn into a clear 503 rather than a raw ImportError/ConnectionError.
+    # "inline" -- worker.InlineQueueAdapter, run synchronously in-process
+    # (same adapter test_intake_lifecycle.py uses); for a from-scratch
+    # dev/CI box with no Redis. Never the silent default in production.
+    logger.info("Intake queue backend: %s", config.RAG_QUEUE_BACKEND)
+    if config.RAG_QUEUE_BACKEND == "inline":
+        state["inline_queue_adapter"] = worker.InlineQueueAdapter(db, embedder, vector_store)
+        state["enqueue_fn"] = state["inline_queue_adapter"].enqueue_fn
+    else:
+        state["inline_queue_adapter"] = None
+        state["enqueue_fn"] = worker.enqueue_processing
 
     all_docs = db.list_documents()
     indexed = [d for d in all_docs if d.approval_status == IngestionState.INDEXED]
@@ -764,6 +784,390 @@ def ingestion_status(document_id: str, x_admin_api_key: Optional[str] = Header(d
     return DocumentStatusResponse(document_id=doc.document_id, source_id=doc.source_id, state=doc.approval_status.value)
 
 
+# ---------------------------------------------------------------------
+# ROUND 4 — CANONICAL /admin/intake/* SURFACE (confirmed decision #6: the
+# legacy /admin/discovery/* and /admin/ingest/* routes above are UNCHANGED
+# and keep working exactly as they did in round 3 -- still synchronous,
+# still calling discovery.approve_and_ingest()/ingestion_pipeline.
+# ingest_document() internally. That was a deliberate choice, not an
+# oversight: decision #6 says legacy routes "MAY" use the new lifecycle
+# internally, not "must", and switching discovery_approve's internals to
+# the new async approve_intake()/queue_intake() path would silently turn
+# its response from "already INDEXED" into "QUEUED, indexing happens
+# later" -- exactly the kind of behavioral change that should be flagged
+# and chosen deliberately by whoever owns that caller (Discovery Engine),
+# not changed under them this round. This new router is the real fix:
+# every NEW caller (Lovable, bulk tooling, PDF uploads) should move to
+# this surface, which actually implements the decoupled, auto-queuing,
+# retry-safe lifecycle brief/decisions 1-5 and 7-9 describe.
+# ---------------------------------------------------------------------
+intake_router = APIRouter(prefix="/admin/intake")
+
+
+def _enqueue_and_drain(fn, *args, **kwargs):
+    """Calls an intake.py function that needs an enqueue_fn, using
+    whatever queue backend startup selected (config.RAG_QUEUE_BACKEND),
+    and immediately drains the inline adapter if that's the backend in
+    use -- so an "inline" dev/CI deployment actually reaches INDEXED/
+    FAILED within the same request instead of leaving a job parked that
+    nothing will ever run (there is no separate `python worker.py`
+    process to pick it up on this backend). On "redis_rq" this is a
+    no-op after the call: the real worker process does the draining,
+    asynchronously, exactly as intended."""
+    try:
+        result = fn(*args, enqueue_fn=state["enqueue_fn"], **kwargs)
+    except (ImportError, ConnectionError, OSError) as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Intake queue backend ({config.RAG_QUEUE_BACKEND}) is unavailable: {e}",
+        )
+    adapter = state.get("inline_queue_adapter")
+    if adapter is not None:
+        adapter.run_pending()
+    return result
+
+
+def _doc_to_intake_response(doc) -> "IntakeDocumentResponse":
+    return IntakeDocumentResponse(
+        document_id=doc.document_id, source_id=doc.source_id, source_type=doc.source_type,
+        state=doc.approval_status.value, title=doc.title, authors=doc.authors, journal=doc.journal,
+        publication_date=doc.publication_date, doi=doc.doi, pmid=doc.pmid, trial_id=doc.trial_id,
+        cmt_subtypes=doc.cmt_subtypes, genes=doc.genes, study_type=doc.study_type,
+        source_tier=doc.source_tier, source_url=doc.source_url,
+        discovery_candidate_id=doc.discovery_candidate_id, source_format=doc.source_format,
+        uploaded_by=doc.uploaded_by, uploaded_at=doc.uploaded_at, original_filename=doc.original_filename,
+        retry_count=doc.retry_count, intake_batch_id=doc.intake_batch_id,
+        approved_by=doc.approved_by, approved_at=doc.approved_at,
+        created_at=doc.created_at, updated_at=doc.updated_at,
+    )
+
+
+class IntakeDocumentResponse(BaseModel):
+    document_id: str
+    source_id: Optional[str] = None
+    source_type: str
+    state: str
+    title: str = ""
+    authors: list = []
+    journal: str = ""
+    publication_date: Optional[str] = None
+    doi: str = ""
+    pmid: str = ""
+    trial_id: str = ""
+    cmt_subtypes: list = []
+    genes: list = []
+    study_type: str = ""
+    source_tier: str = "unspecified"
+    source_url: str = ""
+    discovery_candidate_id: Optional[str] = None
+    source_format: str = ""
+    uploaded_by: Optional[str] = None
+    uploaded_at: Optional[str] = None
+    original_filename: str = ""
+    retry_count: int = 0
+    intake_batch_id: Optional[str] = None
+    approved_by: Optional[str] = None
+    approved_at: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
+class IntakeJobResponse(IntakeDocumentResponse):
+    job_id: Optional[str] = None
+
+
+class IntakeRegisterRequest(BaseModel):
+    source_type: Literal["discovery", "direct_upload"]
+    raw_text: str
+    format: Literal["text", "markdown"] = "text"
+    title: str = ""
+    authors: list = []
+    journal: str = ""
+    publication_date: Optional[str] = None
+    doi: str = ""
+    pmid: str = ""
+    trial_id: str = ""
+    cmt_subtypes: list = []
+    genes: list = []
+    study_type: str = ""
+    source_tier: str = "unspecified"
+    source_url: str = ""
+    discovery_candidate_id: Optional[str] = None
+    knowledge_version: Optional[str] = None
+    uploaded_by: Optional[str] = None
+    original_filename: str = ""
+    actor: str
+
+
+def _intake_exc_to_http(e: Exception):
+    if isinstance(e, intake.InvalidSourceType) or isinstance(e, intake.FullTextRuleViolation) \
+            or isinstance(e, IngestionValidationError):
+        return HTTPException(status_code=422, detail=str(e))
+    # IllegalStateTransitionError IS a ValueError (see config.py) -- this
+    # branch MUST be checked before the generic ValueError->404 branch
+    # below, or "document exists but is in the wrong state" (e.g.
+    # approving an already-INDEXED document, retrying a non-FAILED one)
+    # gets mislabeled as "no such document".
+    if isinstance(e, (DuplicateDocumentError, intake.IntakeConflictError, IllegalStateTransitionError)):
+        return HTTPException(status_code=409, detail=str(e))
+    if isinstance(e, ValueError):
+        return HTTPException(status_code=404, detail=str(e))
+    raise e
+
+
+@intake_router.post("", response_model=IntakeDocumentResponse)
+def intake_register(payload: IntakeRegisterRequest, x_admin_api_key: Optional[str] = Header(default=None, alias="X-Admin-API-Key")):
+    """DISCOVERED -> PENDING_APPROVAL for text/markdown. For PDF use
+    POST /admin/intake/pdf (multipart)."""
+    require_admin_key(x_admin_api_key)
+    db = state["db"]
+    body = payload.model_dump(exclude={"source_type", "actor", "uploaded_by", "original_filename"})
+    ingestion_input = IngestionInput(**body)
+    try:
+        doc = intake.register_intake(
+            db, ingestion_input, payload.source_type, actor=payload.actor,
+            uploaded_by=payload.uploaded_by, original_filename=payload.original_filename,
+        )
+    except Exception as e:
+        raise _intake_exc_to_http(e)
+    logger.info("AUDIT admin intake_register document_id=%s source_type=%s actor=%s",
+                doc.document_id, payload.source_type, payload.actor)
+    return _doc_to_intake_response(doc)
+
+
+@intake_router.post("/pdf", response_model=IntakeDocumentResponse)
+async def intake_register_pdf(
+    file: UploadFile = File(...),
+    source_type: Literal["discovery", "direct_upload"] = Form(...),
+    actor: str = Form(...),
+    title: str = Form(""),
+    authors_csv: str = Form(""),
+    journal: str = Form(""),
+    publication_date: Optional[str] = Form(None),
+    doi: str = Form(""),
+    pmid: str = Form(""),
+    trial_id: str = Form(""),
+    cmt_subtypes_csv: str = Form(""),
+    genes_csv: str = Form(""),
+    study_type: str = Form(""),
+    source_tier: str = Form("unspecified"),
+    source_url: str = Form(""),
+    discovery_candidate_id: Optional[str] = Form(None),
+    x_admin_api_key: Optional[str] = Header(default=None, alias="X-Admin-API-Key"),
+):
+    """DISCOVERED -> PENDING_APPROVAL for a PDF upload. Same extraction
+    path as the legacy /admin/ingest/manual/pdf (ingestion_pipeline's
+    PDF text extraction), just registered via the new split lifecycle
+    instead of the old fused ingest_document()."""
+    require_admin_key(x_admin_api_key)
+    pdf_bytes = await file.read()
+    db = state["db"]
+    ingestion_input = IngestionInput(
+        raw_bytes=pdf_bytes, format="pdf", title=title,
+        authors=[a.strip() for a in authors_csv.split(",") if a.strip()],
+        journal=journal, publication_date=publication_date, doi=doi, pmid=pmid, trial_id=trial_id,
+        cmt_subtypes=[s.strip() for s in cmt_subtypes_csv.split(",") if s.strip()],
+        genes=[g.strip() for g in genes_csv.split(",") if g.strip()],
+        study_type=study_type, source_tier=source_tier, source_url=source_url,
+        discovery_candidate_id=discovery_candidate_id,
+    )
+    try:
+        doc = intake.register_intake(
+            db, ingestion_input, source_type, actor=actor,
+            uploaded_by=actor if source_type == "direct_upload" else None,
+            original_filename=getattr(file, "filename", "") or "",
+        )
+    except Exception as e:
+        raise _intake_exc_to_http(e)
+    logger.info("AUDIT admin intake_register_pdf document_id=%s source_type=%s actor=%s filename=%s",
+                doc.document_id, source_type, actor, getattr(file, "filename", "?"))
+    return _doc_to_intake_response(doc)
+
+
+@intake_router.get("", response_model=list[IntakeDocumentResponse])
+def intake_list(
+    state_filter: Optional[str] = None,
+    source_type: Optional[Literal["discovery", "direct_upload"]] = None,
+    limit: int = 50,
+    offset: int = 0,
+    x_admin_api_key: Optional[str] = Header(default=None, alias="X-Admin-API-Key"),
+):
+    require_admin_key(x_admin_api_key)
+    db = state["db"]
+    ingestion_state = None
+    if state_filter:
+        try:
+            ingestion_state = IngestionState(state_filter)
+        except ValueError:
+            raise HTTPException(status_code=422, detail=f"Unknown state: {state_filter!r}")
+    docs = db.list_documents_page(state=ingestion_state, source_type=source_type,
+                                   limit=limit, offset=offset)
+    return [_doc_to_intake_response(d) for d in docs]
+
+
+@intake_router.get("/{document_id}", response_model=IntakeDocumentResponse)
+def intake_get(document_id: str, x_admin_api_key: Optional[str] = Header(default=None, alias="X-Admin-API-Key")):
+    require_admin_key(x_admin_api_key)
+    doc = state["db"].get_document(document_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="No such document.")
+    return _doc_to_intake_response(doc)
+
+
+class IntakePatchRequest(BaseModel):
+    title: Optional[str] = None
+    authors: Optional[list] = None
+    journal: Optional[str] = None
+    publication_date: Optional[str] = None
+    doi: Optional[str] = None
+    pmid: Optional[str] = None
+    trial_id: Optional[str] = None
+    source_tier: Optional[str] = None
+    source_url: Optional[str] = None
+
+
+@intake_router.patch("/{document_id}", response_model=IntakeDocumentResponse)
+def intake_patch(document_id: str, payload: IntakePatchRequest,
+                  x_admin_api_key: Optional[str] = Header(default=None, alias="X-Admin-API-Key")):
+    """Metadata correction (confirmed decision #2) -- allowed ONLY while
+    pending_approval, never after, to preserve the audit trail of what
+    was actually reviewed and approved."""
+    require_admin_key(x_admin_api_key)
+    db = state["db"]
+    fields = payload.model_dump(exclude_unset=True)
+    if "source_url" in fields and fields["source_url"]:
+        fields["source_url"] = sanitize_reference_url(fields["source_url"])
+    try:
+        doc = intake.patch_intake_metadata(db, document_id, fields)
+    except Exception as e:
+        raise _intake_exc_to_http(e)
+    logger.info("AUDIT admin intake_patch document_id=%s fields=%s", document_id, sorted(fields))
+    return _doc_to_intake_response(doc)
+
+
+class IntakeRejectRequest(BaseModel):
+    actor: str
+    reason: str = ""
+
+
+@intake_router.post("/{document_id}/reject", response_model=IntakeDocumentResponse)
+def intake_reject(document_id: str, payload: IntakeRejectRequest,
+                   x_admin_api_key: Optional[str] = Header(default=None, alias="X-Admin-API-Key")):
+    require_admin_key(x_admin_api_key)
+    db = state["db"]
+    try:
+        doc = intake.reject_intake(db, document_id, actor=payload.actor, reason=payload.reason)
+    except Exception as e:
+        raise _intake_exc_to_http(e)
+    logger.info("AUDIT admin intake_reject document_id=%s actor=%s reason=%s",
+                document_id, payload.actor, payload.reason)
+    return _doc_to_intake_response(doc)
+
+
+class IntakeActorRequest(BaseModel):
+    actor: str
+
+
+@intake_router.post("/{document_id}/approve", response_model=IntakeJobResponse)
+def intake_approve(document_id: str, payload: IntakeActorRequest,
+                    x_admin_api_key: Optional[str] = Header(default=None, alias="X-Admin-API-Key")):
+    """PENDING_APPROVAL -> APPROVED -> QUEUED in one call (confirmed
+    decision #1: approval auto-queues). Returns the queued state plus the
+    job id -- indexing happens asynchronously on the worker; this request
+    does NOT block on it (that was round 3's bug)."""
+    require_admin_key(x_admin_api_key)
+    db = state["db"]
+    try:
+        doc, job_id = _enqueue_and_drain(intake.approve_intake, db, document_id, actor=payload.actor)
+    except Exception as e:
+        raise _intake_exc_to_http(e)
+    doc = db.get_document(document_id)  # re-fetch: _enqueue_and_drain may have advanced it to INDEXED/FAILED inline
+    logger.info("AUDIT admin intake_approve document_id=%s actor=%s job_id=%s state=%s",
+                document_id, payload.actor, job_id, doc.approval_status.value)
+    resp = _doc_to_intake_response(doc)
+    return IntakeJobResponse(job_id=job_id, **resp.model_dump())
+
+
+@intake_router.post("/{document_id}/retry", response_model=IntakeJobResponse)
+def intake_retry(document_id: str, payload: IntakeActorRequest,
+                  x_admin_api_key: Optional[str] = Header(default=None, alias="X-Admin-API-Key")):
+    """FAILED -> QUEUED: the explicit admin retry confirmed decision #4
+    requires once a document has exhausted MAX_RETRIES automatic
+    attempts and stayed FAILED. Starts a fresh attempt-count cycle
+    (attempt=1) for job-level backoff purposes; documents.retry_count
+    itself is cumulative and is never reset -- it's an audit counter,
+    not a budget."""
+    require_admin_key(x_admin_api_key)
+    db = state["db"]
+    try:
+        doc, job_id = _enqueue_and_drain(intake.queue_intake, db, document_id, actor=payload.actor, attempt=1)
+    except Exception as e:
+        raise _intake_exc_to_http(e)
+    doc = db.get_document(document_id)
+    logger.info("AUDIT admin intake_retry document_id=%s actor=%s job_id=%s state=%s",
+                document_id, payload.actor, job_id, doc.approval_status.value)
+    resp = _doc_to_intake_response(doc)
+    return IntakeJobResponse(job_id=job_id, **resp.model_dump())
+
+
+class IntakeBulkItem(BaseModel):
+    source_type: Literal["discovery", "direct_upload"]
+    payload: dict
+    uploaded_by: Optional[str] = None
+    original_filename: str = ""
+
+
+class IntakeBulkRegisterRequest(BaseModel):
+    items: list[IntakeBulkItem]
+    actor: str
+
+
+class IntakeBulkResultResponse(BaseModel):
+    batch_id: str
+    batch_type: str
+    item_count: int
+    success_count: int
+    failure_count: int
+    results: list[dict]
+
+
+@intake_router.post("/bulk", response_model=IntakeBulkResultResponse)
+def intake_bulk_register(payload: IntakeBulkRegisterRequest,
+                          x_admin_api_key: Optional[str] = Header(default=None, alias="X-Admin-API-Key")):
+    """Confirmed decision #3: one failed document in the batch must not
+    roll back or incorrectly mark others as successful -- intake.
+    bulk_register_intake() loops with a per-item try/except, never one
+    wrapping transaction, so this is structurally true rather than
+    merely tested to be true."""
+    require_admin_key(x_admin_api_key)
+    db = state["db"]
+    items = [item.model_dump() for item in payload.items]
+    result = intake.bulk_register_intake(db, items, actor=payload.actor)
+    logger.info("AUDIT admin intake_bulk_register batch_id=%s actor=%s success=%s failure=%s",
+                result["batch_id"], payload.actor, result.get("success_count"), result.get("failure_count"))
+    return IntakeBulkResultResponse(**result)
+
+
+class IntakeBulkApproveRequest(BaseModel):
+    document_ids: list[str]
+    actor: str
+
+
+@intake_router.post("/bulk/approve", response_model=IntakeBulkResultResponse)
+def intake_bulk_approve(payload: IntakeBulkApproveRequest,
+                         x_admin_api_key: Optional[str] = Header(default=None, alias="X-Admin-API-Key")):
+    """pending_approval -> approved -> queued for each id (approval
+    auto-queues, same as the single-item path -- no separate bulk/queue
+    endpoint, per confirmed decision #3)."""
+    require_admin_key(x_admin_api_key)
+    db = state["db"]
+    result = _enqueue_and_drain(intake.bulk_approve_intake, db, payload.document_ids, actor=payload.actor)
+    logger.info("AUDIT admin intake_bulk_approve batch_id=%s actor=%s success=%s failure=%s",
+                result["batch_id"], payload.actor, result.get("success_count"), result.get("failure_count"))
+    return IntakeBulkResultResponse(**result)
+
+
+app.include_router(intake_router)
 app.include_router(admin_router)
 
 

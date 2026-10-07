@@ -75,6 +75,24 @@ class DocumentRecord:
     knowledge_version: Optional[str] = None
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
+    # --- round 4: intake lifecycle split (register/approve/queue/process) ---
+    source_format: str = ""              # 'pdf' | 'xml' | 'html' | 'text' | 'markdown'
+    uploaded_by: Optional[str] = None    # direct_upload only
+    uploaded_at: Optional[str] = None    # direct_upload only
+    original_filename: str = ""          # direct_upload only
+    extracted_text: str = ""             # populated at register_intake(); consumed by process_intake()
+    retry_count: int = 0
+    intake_batch_id: Optional[str] = None
+
+    @property
+    def source_type(self) -> str:
+        """Brief's vocabulary ('discovery' / 'direct_upload') as a computed
+        alias over the existing `ingestion_method` column ('discovery' /
+        'manual_upload') — deliberately NOT a new stored column/enum. This
+        means the physical schema/call sites for `ingestion_method` are
+        untouched (zero risk to the round-3 tests that already pass), while
+        every round-4 API response and filter uses the brief's own terms."""
+        return "discovery" if self.ingestion_method == "discovery" else "direct_upload"
 
 
 @dataclass
@@ -197,6 +215,64 @@ class DBBackend(ABC):
     @abstractmethod
     def record_discovery_review(self, discovery_candidate_id: str, reviewed_by: str, decision: str, linked_document_id: Optional[str]) -> None: ...
 
+    # -- round 4: intake lifecycle (register/approve/queue/process) --
+    @abstractmethod
+    def set_intake_extras(self, document_id: str, **fields) -> None:
+        """Updates whichever of source_format/uploaded_by/uploaded_at/
+        original_filename/extracted_text/intake_batch_id are passed as
+        kwargs. Exists so create_document()'s INSERT statement (and its
+        fragile positional-tuple shape, unchanged from round 3) never had
+        to be touched for round-4 fields — this is a follow-up UPDATE,
+        not a change to document creation itself."""
+        ...
+
+    @abstractmethod
+    def set_retry_count(self, document_id: str, retry_count: int) -> None: ...
+
+    @abstractmethod
+    def update_document_metadata(self, document_id: str, fields: dict) -> DocumentRecord:
+        """PATCH /admin/intake/{id}. Caller (intake.py) is responsible for
+        enforcing the pending_approval-only rule BEFORE calling this —
+        this method itself just writes whichever of title/authors/journal/
+        publication_date/doi/pmid/trial_id/source_tier/source_url are
+        present in `fields`."""
+        ...
+
+    @abstractmethod
+    def list_documents_page(self, state: Optional[IngestionState] = None,
+                             source_type: Optional[str] = None,
+                             limit: int = 50, offset: int = 0) -> list[DocumentRecord]:
+        """GET /admin/intake listing — state/source_type filters + paging.
+        `source_type` is 'discovery' | 'direct_upload' (the brief's terms);
+        translated internally to the existing ingestion_method column."""
+        ...
+
+    @abstractmethod
+    def create_intake_batch(self, batch_id: str, batch_type: str, created_by: str, item_count: int) -> None: ...
+
+    @abstractmethod
+    def record_batch_item(self, batch_id: str, document_id: Optional[str], status: str, error: Optional[str]) -> None:
+        """Inserts one intake_batch_items row AND increments the parent
+        batch's success_count/failure_count — atomic from the caller's
+        point of view (one call, not two), so a crash between the two
+        can't desync them."""
+        ...
+
+    @abstractmethod
+    def get_batch(self, batch_id: str) -> Optional[dict]: ...
+
+    @abstractmethod
+    def list_batch_items(self, batch_id: str) -> list[dict]: ...
+
+    @abstractmethod
+    def create_processing_job(self, job_id: str, document_id: str, rq_job_id: str, attempt: int) -> None: ...
+
+    @abstractmethod
+    def update_processing_job(self, rq_job_id: str, status: str, error: Optional[str] = None) -> None: ...
+
+    @abstractmethod
+    def get_latest_processing_job(self, document_id: str) -> Optional[dict]: ...
+
     # -- audit --
     @abstractmethod
     def record_answer_audit(self, persona: str, query_scope: str, knowledge_version: str,
@@ -316,7 +392,13 @@ class SqliteBackend(DBBackend):
             approval_status TEXT NOT NULL DEFAULT 'discovered',
             approved_by TEXT, approved_at TEXT,
             knowledge_version TEXT,
-            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            source_format TEXT DEFAULT '',
+            uploaded_by TEXT, uploaded_at TEXT,
+            original_filename TEXT DEFAULT '',
+            extracted_text TEXT DEFAULT '',
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            intake_batch_id TEXT
         );
         CREATE TABLE IF NOT EXISTS chunks (
             chunk_id TEXT PRIMARY KEY,
@@ -373,8 +455,62 @@ class SqliteBackend(DBBackend):
         );
         CREATE INDEX IF NOT EXISTS idx_turns_conversation_id ON conversation_turns (conversation_id, turn_order);
         CREATE INDEX IF NOT EXISTS idx_conversations_user_id ON conversations (user_id, last_activity_at);
+
+        -- round 4: intake lifecycle (register/approve/queue/process split,
+        -- bulk operations, RQ job tracking). Mirrors the Postgres migration
+        -- in migrations/0002_intake_lifecycle.sql.
+        CREATE TABLE IF NOT EXISTS intake_batches (
+            batch_id TEXT PRIMARY KEY,
+            batch_type TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            item_count INTEGER NOT NULL DEFAULT 0,
+            success_count INTEGER NOT NULL DEFAULT 0,
+            failure_count INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS intake_batch_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id TEXT NOT NULL REFERENCES intake_batches(batch_id) ON DELETE CASCADE,
+            document_id TEXT,
+            status TEXT NOT NULL,
+            error TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_batch_items_batch_id ON intake_batch_items (batch_id);
+        CREATE TABLE IF NOT EXISTS processing_jobs (
+            job_id TEXT PRIMARY KEY,
+            document_id TEXT NOT NULL,
+            rq_job_id TEXT NOT NULL UNIQUE,
+            attempt INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL DEFAULT 'queued',
+            enqueued_at TEXT NOT NULL,
+            started_at TEXT, finished_at TEXT, error TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_processing_jobs_document_id ON processing_jobs (document_id);
         """)
         self._conn.commit()
+        # Defensive ALTER TABLE for a *pre-existing* database file created
+        # before round 4 (CREATE TABLE IF NOT EXISTS above is a no-op
+        # against an already-existing `documents` table, so an old DB file
+        # would otherwise be missing these columns). Safe to run every
+        # startup: SQLite has no "ADD COLUMN IF NOT EXISTS" portable across
+        # all versions in use, so duplicate-column errors are caught and
+        # ignored rather than relied on not to happen.
+        for ddl in (
+            "ALTER TABLE documents ADD COLUMN source_format TEXT DEFAULT ''",
+            "ALTER TABLE documents ADD COLUMN uploaded_by TEXT",
+            "ALTER TABLE documents ADD COLUMN uploaded_at TEXT",
+            "ALTER TABLE documents ADD COLUMN original_filename TEXT DEFAULT ''",
+            "ALTER TABLE documents ADD COLUMN extracted_text TEXT DEFAULT ''",
+            "ALTER TABLE documents ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE documents ADD COLUMN intake_batch_id TEXT",
+        ):
+            try:
+                self._conn.execute(ddl)
+                self._conn.commit()
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
 
     # ---- documents ----
     def create_document(self, doc: DocumentRecord) -> None:
@@ -385,8 +521,10 @@ class SqliteBackend(DBBackend):
                  doi, pmid, trial_id, cmt_subtypes, genes, study_type, source_tier,
                  source_url, internal_storage_path, discovery_candidate_id,
                  ingestion_method, approval_status, approved_by, approved_at,
-                 knowledge_version, created_at, updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 knowledge_version, created_at, updated_at,
+                 source_format, uploaded_by, uploaded_at, original_filename,
+                 extracted_text, retry_count, intake_batch_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (doc.document_id, doc.source_id, doc.title, json.dumps(doc.authors),
                  doc.journal, doc.publication_date, doc.doi, doc.pmid, doc.trial_id,
                  json.dumps(doc.cmt_subtypes), json.dumps(doc.genes), doc.study_type,
@@ -394,10 +532,13 @@ class SqliteBackend(DBBackend):
                  doc.discovery_candidate_id, doc.ingestion_method,
                  doc.approval_status.value if isinstance(doc.approval_status, IngestionState) else doc.approval_status,
                  doc.approved_by, doc.approved_at, doc.knowledge_version,
-                 doc.created_at, doc.updated_at),
+                 doc.created_at, doc.updated_at,
+                 doc.source_format, doc.uploaded_by, doc.uploaded_at, doc.original_filename,
+                 doc.extracted_text, doc.retry_count, doc.intake_batch_id),
             )
 
     def _row_to_doc(self, row) -> DocumentRecord:
+        keys = row.keys()
         return DocumentRecord(
             document_id=row["document_id"], source_id=row["source_id"],
             title=row["title"] or "", authors=json.loads(row["authors"] or "[]"),
@@ -413,6 +554,15 @@ class SqliteBackend(DBBackend):
             approved_by=row["approved_by"], approved_at=row["approved_at"],
             knowledge_version=row["knowledge_version"],
             created_at=row["created_at"], updated_at=row["updated_at"],
+            # round 4 columns: read defensively (`in keys()`) so this keeps
+            # working against a pre-round-4 DB file mid-migration too.
+            source_format=(row["source_format"] or "") if "source_format" in keys else "",
+            uploaded_by=row["uploaded_by"] if "uploaded_by" in keys else None,
+            uploaded_at=row["uploaded_at"] if "uploaded_at" in keys else None,
+            original_filename=(row["original_filename"] or "") if "original_filename" in keys else "",
+            extracted_text=(row["extracted_text"] or "") if "extracted_text" in keys else "",
+            retry_count=(row["retry_count"] or 0) if "retry_count" in keys else 0,
+            intake_batch_id=row["intake_batch_id"] if "intake_batch_id" in keys else None,
         )
 
     def get_document(self, document_id: str) -> Optional[DocumentRecord]:
@@ -626,6 +776,137 @@ class SqliteBackend(DBBackend):
                 " linked_document_id=? WHERE discovery_candidate_id=?",
                 (reviewed_by, _now(), decision, linked_document_id, discovery_candidate_id),
             )
+
+    # ---- round 4: intake lifecycle ----
+    _INTAKE_EXTRA_COLUMNS = {
+        "source_format", "uploaded_by", "uploaded_at", "original_filename",
+        "extracted_text", "intake_batch_id",
+    }
+
+    def set_intake_extras(self, document_id: str, **fields) -> None:
+        cols = {k: v for k, v in fields.items() if k in self._INTAKE_EXTRA_COLUMNS}
+        if not cols:
+            return
+        set_clause = ", ".join(f"{k} = ?" for k in cols)
+        with self._conn:
+            self._conn.execute(
+                f"UPDATE documents SET {set_clause}, updated_at = ? WHERE document_id = ?",
+                (*cols.values(), _now(), document_id),
+            )
+
+    def set_retry_count(self, document_id: str, retry_count: int) -> None:
+        with self._conn:
+            self._conn.execute(
+                "UPDATE documents SET retry_count = ?, updated_at = ? WHERE document_id = ?",
+                (retry_count, _now(), document_id),
+            )
+
+    _METADATA_PATCH_COLUMNS = {
+        "title", "authors", "journal", "publication_date", "doi", "pmid",
+        "trial_id", "source_tier", "source_url",
+    }
+
+    def update_document_metadata(self, document_id: str, fields: dict) -> DocumentRecord:
+        cols = {k: v for k, v in fields.items() if k in self._METADATA_PATCH_COLUMNS}
+        if cols:
+            # authors/cmt_subtypes/genes are stored as JSON text, same as create_document
+            if "authors" in cols and isinstance(cols["authors"], list):
+                cols["authors"] = json.dumps(cols["authors"])
+            set_clause = ", ".join(f"{k} = ?" for k in cols)
+            with self._conn:
+                self._conn.execute(
+                    f"UPDATE documents SET {set_clause}, updated_at = ? WHERE document_id = ?",
+                    (*cols.values(), _now(), document_id),
+                )
+        doc = self.get_document(document_id)
+        if doc is None:
+            raise ValueError(f"No such document: {document_id}")
+        return doc
+
+    def list_documents_page(self, state: Optional[IngestionState] = None,
+                             source_type: Optional[str] = None,
+                             limit: int = 50, offset: int = 0) -> list[DocumentRecord]:
+        clauses, params = [], []
+        if state is not None:
+            clauses.append("approval_status = ?")
+            params.append(state.value)
+        if source_type is not None:
+            # 'direct_upload' (brief's term) -> everything NOT 'discovery' in
+            # the existing ingestion_method column; 'discovery' passes through.
+            if source_type == "discovery":
+                clauses.append("ingestion_method = 'discovery'")
+            else:
+                clauses.append("ingestion_method != 'discovery'")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"SELECT * FROM documents {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        ).fetchall()
+        return [self._row_to_doc(r) for r in rows]
+
+    def create_intake_batch(self, batch_id: str, batch_type: str, created_by: str, item_count: int) -> None:
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO intake_batches (batch_id, batch_type, created_by, created_at, item_count)"
+                " VALUES (?,?,?,?,?)",
+                (batch_id, batch_type, created_by, _now(), item_count),
+            )
+
+    def record_batch_item(self, batch_id: str, document_id: Optional[str], status: str, error: Optional[str]) -> None:
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO intake_batch_items (batch_id, document_id, status, error, created_at)"
+                " VALUES (?,?,?,?,?)",
+                (batch_id, document_id, status, error, _now()),
+            )
+            col = "success_count" if status == "success" else "failure_count"
+            self._conn.execute(
+                f"UPDATE intake_batches SET {col} = {col} + 1 WHERE batch_id = ?", (batch_id,)
+            )
+
+    def get_batch(self, batch_id: str) -> Optional[dict]:
+        row = self._conn.execute("SELECT * FROM intake_batches WHERE batch_id = ?", (batch_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_batch_items(self, batch_id: str) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM intake_batch_items WHERE batch_id = ? ORDER BY id", (batch_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def create_processing_job(self, job_id: str, document_id: str, rq_job_id: str, attempt: int) -> None:
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO processing_jobs (job_id, document_id, rq_job_id, attempt, status, enqueued_at)"
+                " VALUES (?,?,?,?,'queued',?)",
+                (job_id, document_id, rq_job_id, attempt, _now()),
+            )
+
+    def update_processing_job(self, rq_job_id: str, status: str, error: Optional[str] = None) -> None:
+        now = _now()
+        with self._conn:
+            if status == "started":
+                self._conn.execute(
+                    "UPDATE processing_jobs SET status=?, started_at=? WHERE rq_job_id=?",
+                    (status, now, rq_job_id),
+                )
+            elif status in ("finished", "failed"):
+                self._conn.execute(
+                    "UPDATE processing_jobs SET status=?, finished_at=?, error=? WHERE rq_job_id=?",
+                    (status, now, error, rq_job_id),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE processing_jobs SET status=?, error=? WHERE rq_job_id=?",
+                    (status, error, rq_job_id),
+                )
+
+    def get_latest_processing_job(self, document_id: str) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM processing_jobs WHERE document_id = ? ORDER BY enqueued_at DESC LIMIT 1",
+            (document_id,),
+        ).fetchone()
+        return dict(row) if row else None
 
     # ---- audit ----
     def record_answer_audit(self, persona, query_scope, knowledge_version,
@@ -992,6 +1273,151 @@ class PostgresBackend(DBBackend):
                 " review_decision=%s, linked_document_id=%s WHERE discovery_candidate_id=%s",
                 (reviewed_by, decision, linked_document_id, discovery_candidate_id),
             )
+
+    # ---- round 4: intake lifecycle ----
+    # Written to the same interface/behavior as SqliteBackend's methods
+    # above. NOT executed against a real server in this sandbox (no
+    # psycopg2/network — same constraint as every other PostgresBackend
+    # method; see the class docstring and DELIVERABLES_ROUND4.md). The SQL
+    # itself (migrations/0002_intake_lifecycle.sql) WAS verified live via
+    # `psql` directly against a local Postgres 16 instance — see that doc
+    # for what "verified" means here vs. this Python code path.
+    _INTAKE_EXTRA_COLUMNS = {
+        "source_format", "uploaded_by", "uploaded_at", "original_filename",
+        "extracted_text", "intake_batch_id",
+    }
+
+    def set_intake_extras(self, document_id: str, **fields) -> None:
+        cols = {k: v for k, v in fields.items() if k in self._INTAKE_EXTRA_COLUMNS}
+        if not cols:
+            return
+        set_clause = ", ".join(f"{k} = %s" for k in cols)
+        with self._cursor() as cur:
+            cur.execute(
+                f"UPDATE cmt_veda_rag.documents SET {set_clause}, updated_at = now() WHERE document_id = %s",
+                (*cols.values(), document_id),
+            )
+
+    def set_retry_count(self, document_id: str, retry_count: int) -> None:
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE cmt_veda_rag.documents SET retry_count = %s, updated_at = now() WHERE document_id = %s",
+                (retry_count, document_id),
+            )
+
+    _METADATA_PATCH_COLUMNS = {
+        "title", "authors", "journal", "publication_date", "doi", "pmid",
+        "trial_id", "source_tier", "source_url",
+    }
+
+    def update_document_metadata(self, document_id: str, fields: dict) -> DocumentRecord:
+        cols = {k: v for k, v in fields.items() if k in self._METADATA_PATCH_COLUMNS}
+        if cols:
+            set_clause = ", ".join(f"{k} = %s" for k in cols)
+            with self._cursor() as cur:
+                cur.execute(
+                    f"UPDATE cmt_veda_rag.documents SET {set_clause}, updated_at = now() WHERE document_id = %s",
+                    (*cols.values(), document_id),
+                )
+        doc = self.get_document(document_id)
+        if doc is None:
+            raise ValueError(f"No such document: {document_id}")
+        return doc
+
+    def list_documents_page(self, state: Optional[IngestionState] = None,
+                             source_type: Optional[str] = None,
+                             limit: int = 50, offset: int = 0) -> list[DocumentRecord]:
+        clauses, params = [], []
+        if state is not None:
+            clauses.append("approval_status = %s")
+            params.append(state.value)
+        if source_type is not None:
+            if source_type == "discovery":
+                clauses.append("ingestion_method = 'discovery'")
+            else:
+                clauses.append("ingestion_method != 'discovery'")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._cursor() as cur:
+            cur.execute(
+                f"SELECT * FROM cmt_veda_rag.documents {where} ORDER BY created_at DESC LIMIT %s OFFSET %s",
+                (*params, limit, offset),
+            )
+            rows = cur.fetchall()
+        out = []
+        for row in rows:
+            row = dict(row); row["approval_status"] = IngestionState(row["approval_status"])
+            out.append(DocumentRecord(**row))
+        return out
+
+    def create_intake_batch(self, batch_id: str, batch_type: str, created_by: str, item_count: int) -> None:
+        with self._cursor() as cur:
+            cur.execute(
+                "INSERT INTO cmt_veda_rag.intake_batches (batch_id, batch_type, created_by, item_count)"
+                " VALUES (%s,%s,%s,%s)",
+                (batch_id, batch_type, created_by, item_count),
+            )
+
+    def record_batch_item(self, batch_id: str, document_id: Optional[str], status: str, error: Optional[str]) -> None:
+        with self._cursor() as cur:
+            cur.execute(
+                "INSERT INTO cmt_veda_rag.intake_batch_items (batch_id, document_id, status, error)"
+                " VALUES (%s,%s,%s,%s)",
+                (batch_id, document_id, status, error),
+            )
+            col = "success_count" if status == "success" else "failure_count"
+            cur.execute(
+                f"UPDATE cmt_veda_rag.intake_batches SET {col} = {col} + 1 WHERE batch_id = %s", (batch_id,)
+            )
+
+    def get_batch(self, batch_id: str) -> Optional[dict]:
+        with self._cursor() as cur:
+            cur.execute("SELECT * FROM cmt_veda_rag.intake_batches WHERE batch_id = %s", (batch_id,))
+            row = cur.fetchone()
+        return dict(row) if row else None
+
+    def list_batch_items(self, batch_id: str) -> list[dict]:
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT * FROM cmt_veda_rag.intake_batch_items WHERE batch_id = %s ORDER BY id", (batch_id,)
+            )
+            rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+    def create_processing_job(self, job_id: str, document_id: str, rq_job_id: str, attempt: int) -> None:
+        with self._cursor() as cur:
+            cur.execute(
+                "INSERT INTO cmt_veda_rag.processing_jobs (job_id, document_id, rq_job_id, attempt, status)"
+                " VALUES (%s,%s,%s,%s,'queued')",
+                (job_id, document_id, rq_job_id, attempt),
+            )
+
+    def update_processing_job(self, rq_job_id: str, status: str, error: Optional[str] = None) -> None:
+        with self._cursor() as cur:
+            if status == "started":
+                cur.execute(
+                    "UPDATE cmt_veda_rag.processing_jobs SET status=%s, started_at=now() WHERE rq_job_id=%s",
+                    (status, rq_job_id),
+                )
+            elif status in ("finished", "failed"):
+                cur.execute(
+                    "UPDATE cmt_veda_rag.processing_jobs SET status=%s, finished_at=now(), error=%s WHERE rq_job_id=%s",
+                    (status, error, rq_job_id),
+                )
+            else:
+                cur.execute(
+                    "UPDATE cmt_veda_rag.processing_jobs SET status=%s, error=%s WHERE rq_job_id=%s",
+                    (status, error, rq_job_id),
+                )
+
+    def get_latest_processing_job(self, document_id: str) -> Optional[dict]:
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT * FROM cmt_veda_rag.processing_jobs WHERE document_id = %s"
+                " ORDER BY enqueued_at DESC LIMIT 1",
+                (document_id,),
+            )
+            row = cur.fetchone()
+        return dict(row) if row else None
 
     def record_answer_audit(self, persona, query_scope, knowledge_version,
                             retrieved_chunk_ids, cited_source_ids, insufficient_evidence) -> None:

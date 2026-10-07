@@ -215,11 +215,26 @@ _ALLOWED_TRANSITIONS = {
 }
 
 
+class IllegalStateTransitionError(ValueError):
+    """Raised by validate_transition() for a lifecycle transition that
+    isn't in _ALLOWED_TRANSITIONS (e.g. approving an already-INDEXED
+    document, or retrying one that isn't FAILED). A ValueError subclass
+    on purpose -- every pre-existing `except ValueError` call site (the
+    legacy /admin/ingest/remove handler, discovery.py, etc.) keeps
+    catching it unchanged. Added in round 4 so main.py's new
+    /admin/intake/* routes can map THIS specific case to 409 Conflict
+    instead of the generic ValueError->404 mapping, which was
+    mislabeling "document exists but is in the wrong state" as "no such
+    document" -- a real contract bug caught while writing the final API
+    contract doc, fixed here rather than documented as correct."""
+
+
 def validate_transition(current: "IngestionState", new_state: "IngestionState") -> None:
-    """Raises ValueError on an illegal lifecycle transition."""
+    """Raises IllegalStateTransitionError (a ValueError) on an illegal
+    lifecycle transition."""
     allowed = _ALLOWED_TRANSITIONS.get(current, set())
     if new_state not in allowed:
-        raise ValueError(f"Illegal ingestion state transition {current} -> {new_state}")
+        raise IllegalStateTransitionError(f"Illegal ingestion state transition {current} -> {new_state}")
 
 SOURCE_ID_PREFIX = "CMT-RAG-"
 SOURCE_ID_DIGITS = 6
@@ -250,4 +265,63 @@ RAG_VECTOR_STORE_PATH = os.environ.get("RAG_VECTOR_STORE_PATH", "./vector_store"
 # used ONLY to test pipeline wiring/citation validation in this sandbox —
 # it does not demonstrate that a real model follows the grounding rules.
 RAG_GENERATION_BACKEND = os.environ.get("RAG_GENERATION_BACKEND", "mock")
+
+# ---------------------------------------------------------------------
+# INTAKE LIFECYCLE (round 4: register/approve/queue/process split,
+# bulk operations, async worker — see DELIVERABLES_ROUND4.md)
+# ---------------------------------------------------------------------
+
+# The only two source types the intake API will accept. Enforced here AND
+# at the database level (the source_type enum in the round-4 migration) —
+# defense in depth, same pattern as RETRIEVABLE_STATE above. This is also
+# the enforcement point for "Newsletter independence" (brief §16/§8): the
+# Newsletter pipeline has no caller anywhere in this codebase that reaches
+# register_intake(), and even if something did call it with a value like
+# 'newsletter' or 'editorial', this allowlist rejects it before a document
+# row is ever created.
+ALLOWED_SOURCE_TYPES = {"discovery", "direct_upload"}
+
+# Full-text-only rule (brief §4). This is a minimum-length HEURISTIC, not
+# a real abstract-vs-full-text classifier — honestly flagged as a gap, not
+# hidden. A short but genuine full-text letter/note could theoretically be
+# rejected; an unusually long abstract could theoretically pass. Real
+# enforcement of "genuine full text" ultimately depends on what Discovery
+# and the admin UI assert about the material before it ever reaches this
+# API — this floor just catches the obvious case (an abstract, or nothing
+# at all) at the backend level per the brief's explicit instruction not to
+# rely on the UI alone.
+MIN_FULL_TEXT_CHARS = int(os.environ.get("RAG_MIN_FULL_TEXT_CHARS", "1000"))
+
+# Retry policy (brief §12, your confirmed decision: 5 attempts, exponential
+# backoff). PostgreSQL (documents.retry_count, processing_jobs) is the
+# durable source of truth for all of this — these constants only decide
+# the *policy*, never the bookkeeping, which always goes through db.py.
+MAX_RETRIES = int(os.environ.get("RAG_MAX_RETRIES", "5"))
+RETRY_BACKOFF_BASE_SECONDS = int(os.environ.get("RAG_RETRY_BACKOFF_BASE_SECONDS", "30"))
+
+
+def retry_backoff_seconds(attempt: int) -> int:
+    """Exponential backoff: 30s, 60s, 120s, 240s, 480s for attempts 1-5.
+    `attempt` is 1-indexed (the attempt that just failed)."""
+    return RETRY_BACKOFF_BASE_SECONDS * (2 ** max(attempt - 1, 0))
+
+
+# Redis/RQ — the asynchronous job-delivery layer ONLY (brief §12/§5). Never
+# consulted on the Ask Veda retrieval path (retrieval.py queries the
+# already-indexed corpus directly; nothing there touches Redis or RQ).
+# NOT available in this sandbox (no `redis` or `rq` package, no network to
+# install them — same constraint DELIVERABLES.md documents for psycopg2).
+# worker.py's InlineQueueAdapter is the tested, synchronous substitute;
+# RQ/Redis wiring in worker.py is written but unexecuted here.
+REDIS_URL = os.environ.get("RAG_REDIS_URL", "redis://localhost:6379/0")
+RQ_QUEUE_NAME = os.environ.get("RAG_RQ_QUEUE_NAME", "cmt_veda_intake")
+RQ_JOB_TIMEOUT_SECONDS = int(os.environ.get("RAG_RQ_JOB_TIMEOUT_SECONDS", "600"))
+
+# Which enqueue_fn main.py's /admin/intake/* routes wire up at startup.
+# "redis_rq" (default — the real production path, worker.enqueue_processing)
+# requires the redis/rq packages and a reachable Redis; set to "inline" to
+# run the API with worker.InlineQueueAdapter instead (same adapter
+# test_intake_lifecycle.py uses) on a from-scratch dev/CI box with no
+# Redis — never silently substituted; this flag is the only switch.
+RAG_QUEUE_BACKEND = os.environ.get("RAG_QUEUE_BACKEND", "redis_rq")
 
