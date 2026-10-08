@@ -37,6 +37,7 @@ from typing import Callable, Optional
 
 from config import (
     IngestionState, ALLOWED_SOURCE_TYPES, MIN_FULL_TEXT_CHARS, MAX_RETRIES,
+    CONTENT_TYPES, ALLOWED_SOURCE_FORMATS, FULL_TEXT_REQUIRED_CONTENT_TYPES,
 )
 from db import DBBackend, DocumentRecord, ChunkRecord, DuplicateDocumentError
 from ingestion_pipeline import (
@@ -68,11 +69,16 @@ class InvalidSourceType(IntakeError):
     pass
 
 
+class InvalidContentType(IntakeError):
+    """content_type / source_format outside the allowlist (config.CONTENT_TYPES,
+    config.ALLOWED_SOURCE_FORMATS). Rejected before any row is created."""
+
+
 class IntakeConflictError(IntakeError):
     """A job is already in flight, or metadata edit attempted post-approval."""
 
 
-def _enforce_full_text_only(extracted_text: str) -> None:
+def _enforce_full_text_only(extracted_text: str, content_type: str = "research_paper") -> None:
     """Brief §4: 'A document is eligible for RAG only if genuine full text
     is available' / §16: Newsletter content must never enter RAG. This is
     a minimum-length HEURISTIC (config.MIN_FULL_TEXT_CHARS) — honestly not
@@ -82,6 +88,11 @@ def _enforce_full_text_only(extracted_text: str) -> None:
     Newsletter pipeline calls register_intake(), and the source_type
     allowlist below rejects anything that isn't 'discovery' or
     'direct_upload' before a document row is ever created."""
+    if content_type not in FULL_TEXT_REQUIRED_CONTENT_TYPES:
+        # Structured records (clinical_trial, genetic_variant) are legitimately
+        # short and are NOT the full text of a paper; the 50-character
+        # corrupted-content floor in register_intake() still applies.
+        return
     if len(extracted_text.strip()) < MIN_FULL_TEXT_CHARS:
         raise FullTextRuleViolation(
             f"Document text is {len(extracted_text.strip())} characters, below the "
@@ -114,6 +125,18 @@ def register_intake(
             f"{source_type!r}. Rejected before any document row was created."
         )
 
+    content_type = payload.content_type or "research_paper"
+    if content_type not in CONTENT_TYPES:
+        raise InvalidContentType(
+            f"content_type must be one of {list(CONTENT_TYPES)}, got {content_type!r}. "
+            f"Rejected before any document row was created."
+        )
+    source_format = payload.source_format or payload.format
+    if source_format not in ALLOWED_SOURCE_FORMATS:
+        raise InvalidContentType(
+            f"source_format must be one of {sorted(ALLOWED_SOURCE_FORMATS)}, got {source_format!r}."
+        )
+
     validate_input(payload)
     extracted_text = _extract_text(payload)
     if not extracted_text or not extracted_text.strip():
@@ -123,7 +146,7 @@ def register_intake(
             "Document text is suspiciously short (<50 chars) — rejecting "
             "rather than registering likely-corrupted content."
         )
-    _enforce_full_text_only(extracted_text)
+    _enforce_full_text_only(extracted_text, content_type)
 
     auto_meta = auto_extract_metadata(extracted_text)
     genes = sorted(set(payload.genes) | set(auto_meta["genes"]))
@@ -131,6 +154,22 @@ def register_intake(
 
     if not allow_duplicate:
         dup = db.find_duplicate(doi=payload.doi, pmid=payload.pmid, title=payload.title)
+        if (dup is not None and dup.approval_status == IngestionState.PENDING_APPROVAL
+                and not (dup.extracted_text or "").strip()):
+            # REPAIR, not a duplicate: an earlier PostgresBackend.create_document()
+            # dropped extracted_text (live bug, fixed alongside this), leaving a
+            # pending row that can never be processed. Re-registering the same
+            # source fills in the missing text/provenance IN PLACE -- same
+            # document_id and source_id, still pending_approval, no state change,
+            # no approval bypass -- so the caller just re-sends its register call.
+            db.set_intake_extras(
+                dup.document_id, extracted_text=extracted_text, source_format=source_format,
+                content_type=content_type, source_mime_type=payload.source_mime_type,
+                source_content_hash=payload.source_content_hash,
+                source_document_ref=payload.source_document_ref,
+                extraction_status=payload.extraction_status,
+            )
+            return db.get_document(dup.document_id)
         if dup is not None:
             raise DuplicateDocumentError(
                 f"Duplicate of existing document {dup.document_id} "
@@ -154,7 +193,15 @@ def register_intake(
         ingestion_method=ingestion_method,
         approval_status=IngestionState.DISCOVERED,
         knowledge_version=payload.knowledge_version,
-        source_format=payload.format,
+        # Provenance: the ORIGINAL representation (pdf/xml/html/...) when the
+        # caller says so; otherwise the text format, as before. Processing
+        # never reads this -- it works from extracted_text whatever the origin.
+        source_format=source_format,
+        content_type=content_type,
+        source_mime_type=payload.source_mime_type,
+        source_content_hash=payload.source_content_hash,
+        source_document_ref=payload.source_document_ref,
+        extraction_status=payload.extraction_status,
         uploaded_by=uploaded_by,
         uploaded_at=_now() if uploaded_by else None,
         original_filename=original_filename,

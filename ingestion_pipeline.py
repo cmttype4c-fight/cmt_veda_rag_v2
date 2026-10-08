@@ -96,6 +96,16 @@ class IngestionInput:
     # patched it locally); fixed here in the source of truth instead of
     # leaving the canonical repo behind a field deployment's hotfix.
     knowledge_version: Optional[str] = None
+    # --- scientific taxonomy + provenance (additive; all optional) ---
+    # `format` above describes the TEXT handed to RAG ("text"/"markdown"/"pdf").
+    # `source_format` is the ORIGINAL representation the text was extracted
+    # from ("pdf"/"xml"/"html"/...); empty -> falls back to `format`.
+    content_type: str = "research_paper"
+    source_format: str = ""
+    source_mime_type: str = ""
+    source_content_hash: str = ""
+    source_document_ref: str = ""
+    extraction_status: str = ""
 
 
 def _validate_pdf_bytes(data: Optional[bytes]) -> None:
@@ -163,7 +173,9 @@ def auto_extract_metadata(raw_text: str) -> dict:
     """Supplement (never replace) human-provided metadata by scanning the
     text for genes/subtypes the entity extractor recognizes. Anything not
     found stays explicitly empty — never fabricated (section V)."""
-    ents = extract_entities(raw_text[:20000])  # cap scan length for speed
+    # Scan the WHOLE text. (This used to scan only the first 20,000 characters,
+    # so genes/subtypes first mentioned later in a long paper were missed.)
+    ents = extract_entities(raw_text)
     return {
         "genes": sorted(ents.genes),
         "cmt_subtypes": sorted(ents.subtypes),

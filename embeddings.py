@@ -131,6 +131,9 @@ class SentenceTransformerEmbeddings(EmbeddingBackend):
                 "in this environment. Install it in your deployment venv."
             ) from e
         self._model = SentenceTransformer(model_name)
+        import config
+        if config.RAG_EMBEDDING_MAX_SEQ_LENGTH > 0:
+            self._model.max_seq_length = config.RAG_EMBEDDING_MAX_SEQ_LENGTH
         self._dim = self._model.get_sentence_embedding_dimension()
 
     @property

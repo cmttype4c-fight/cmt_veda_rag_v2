@@ -71,6 +71,13 @@ Rules (violating any of these is a critical failure):
 6. Distinguish human clinical evidence, observational evidence,
    preclinical/animal evidence, in-vitro evidence, and hypotheses whenever
    relevant and supported by the source.
+6b. Each evidence block states its source_kind. Attribute claims to the right
+   KIND of source and never blur them: a genetic_variant block is a database
+   classification ("ClinVar reports/classifies this variant as ..."), a
+   clinical_trial block is a trial-registry record ("the registered trial
+   lists ..."), and only a research_paper block is published research ("a
+   study reports ..."). Never present a database or registry record as if it
+   were a published study.
 7. If sources disagree, do not silently pick one as fact — explain what
    each reports and, if supported, why they might differ.
 8. Cite the Source ID(s) in square brackets right after the claim they
@@ -101,6 +108,7 @@ def build_messages(
     context_blocks = []
     for c in candidates:
         tier = c.metadata.get("source_tier", "unspecified")
+        kind = c.metadata.get("content_type", "research_paper")
         section = c.section or "body"
         # BUG FIX: CONTEXT_CHARS_PER_CHUNK was declared in config.py but
         # never actually applied here — every candidate's FULL text (up
@@ -114,7 +122,7 @@ def build_messages(
         # enforcement that should run before generation.
         text = c.text[:CONTEXT_CHARS_PER_CHUNK]
         context_blocks.append(
-            f"[{c.source_id}] (section: {section}; source_tier: {tier})\n{text}"
+            f"[{c.source_id}] (section: {section}; source_tier: {tier}; source_kind: {kind})\n{text}"
         )
     context = "\n\n".join(context_blocks)
 

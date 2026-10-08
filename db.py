@@ -33,6 +33,7 @@ rejected at the persistence layer itself, not just in application code
 that a future call site could bypass.
 """
 
+import dataclasses
 import json
 import sqlite3
 import uuid
@@ -83,6 +84,12 @@ class DocumentRecord:
     extracted_text: str = ""             # populated at register_intake(); consumed by process_intake()
     retry_count: int = 0
     intake_batch_id: Optional[str] = None
+    # --- scientific taxonomy + provenance (migration 0003; all additive) ---
+    content_type: str = "research_paper"  # research_paper | clinical_trial | genetic_variant | ...
+    source_mime_type: str = ""
+    source_content_hash: str = ""
+    source_document_ref: str = ""
+    extraction_status: str = ""
 
     @property
     def source_type(self) -> str:
@@ -241,7 +248,8 @@ class DBBackend(ABC):
     @abstractmethod
     def list_documents_page(self, state: Optional[IngestionState] = None,
                              source_type: Optional[str] = None,
-                             limit: int = 50, offset: int = 0) -> list[DocumentRecord]:
+                             limit: int = 50, offset: int = 0,
+                             content_type: Optional[str] = None) -> list[DocumentRecord]:
         """GET /admin/intake listing — state/source_type filters + paging.
         `source_type` is 'discovery' | 'direct_upload' (the brief's terms);
         translated internally to the existing ingestion_method column."""
@@ -504,6 +512,11 @@ class SqliteBackend(DBBackend):
             "ALTER TABLE documents ADD COLUMN extracted_text TEXT DEFAULT ''",
             "ALTER TABLE documents ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE documents ADD COLUMN intake_batch_id TEXT",
+            "ALTER TABLE documents ADD COLUMN content_type TEXT NOT NULL DEFAULT 'research_paper'",
+            "ALTER TABLE documents ADD COLUMN source_mime_type TEXT DEFAULT ''",
+            "ALTER TABLE documents ADD COLUMN source_content_hash TEXT DEFAULT ''",
+            "ALTER TABLE documents ADD COLUMN source_document_ref TEXT DEFAULT ''",
+            "ALTER TABLE documents ADD COLUMN extraction_status TEXT DEFAULT ''",
         ):
             try:
                 self._conn.execute(ddl)
@@ -523,8 +536,10 @@ class SqliteBackend(DBBackend):
                  ingestion_method, approval_status, approved_by, approved_at,
                  knowledge_version, created_at, updated_at,
                  source_format, uploaded_by, uploaded_at, original_filename,
-                 extracted_text, retry_count, intake_batch_id)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 extracted_text, retry_count, intake_batch_id,
+                 content_type, source_mime_type, source_content_hash,
+                 source_document_ref, extraction_status)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (doc.document_id, doc.source_id, doc.title, json.dumps(doc.authors),
                  doc.journal, doc.publication_date, doc.doi, doc.pmid, doc.trial_id,
                  json.dumps(doc.cmt_subtypes), json.dumps(doc.genes), doc.study_type,
@@ -534,7 +549,9 @@ class SqliteBackend(DBBackend):
                  doc.approved_by, doc.approved_at, doc.knowledge_version,
                  doc.created_at, doc.updated_at,
                  doc.source_format, doc.uploaded_by, doc.uploaded_at, doc.original_filename,
-                 doc.extracted_text, doc.retry_count, doc.intake_batch_id),
+                 doc.extracted_text, doc.retry_count, doc.intake_batch_id,
+                 doc.content_type or "research_paper", doc.source_mime_type,
+                 doc.source_content_hash, doc.source_document_ref, doc.extraction_status),
             )
 
     def _row_to_doc(self, row) -> DocumentRecord:
@@ -563,6 +580,11 @@ class SqliteBackend(DBBackend):
             extracted_text=(row["extracted_text"] or "") if "extracted_text" in keys else "",
             retry_count=(row["retry_count"] or 0) if "retry_count" in keys else 0,
             intake_batch_id=row["intake_batch_id"] if "intake_batch_id" in keys else None,
+            content_type=(row["content_type"] or "research_paper") if "content_type" in keys else "research_paper",
+            source_mime_type=(row["source_mime_type"] or "") if "source_mime_type" in keys else "",
+            source_content_hash=(row["source_content_hash"] or "") if "source_content_hash" in keys else "",
+            source_document_ref=(row["source_document_ref"] or "") if "source_document_ref" in keys else "",
+            extraction_status=(row["extraction_status"] or "") if "extraction_status" in keys else "",
         )
 
     def get_document(self, document_id: str) -> Optional[DocumentRecord]:
@@ -781,6 +803,8 @@ class SqliteBackend(DBBackend):
     _INTAKE_EXTRA_COLUMNS = {
         "source_format", "uploaded_by", "uploaded_at", "original_filename",
         "extracted_text", "intake_batch_id",
+        "content_type", "source_mime_type", "source_content_hash",
+        "source_document_ref", "extraction_status",
     }
 
     def set_intake_extras(self, document_id: str, **fields) -> None:
@@ -825,7 +849,8 @@ class SqliteBackend(DBBackend):
 
     def list_documents_page(self, state: Optional[IngestionState] = None,
                              source_type: Optional[str] = None,
-                             limit: int = 50, offset: int = 0) -> list[DocumentRecord]:
+                             limit: int = 50, offset: int = 0,
+                             content_type: Optional[str] = None) -> list[DocumentRecord]:
         clauses, params = [], []
         if state is not None:
             clauses.append("approval_status = ?")
@@ -837,6 +862,9 @@ class SqliteBackend(DBBackend):
                 clauses.append("ingestion_method = 'discovery'")
             else:
                 clauses.append("ingestion_method != 'discovery'")
+        if content_type is not None:
+            clauses.append("content_type = ?")
+            params.append(content_type)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self._conn.execute(
             f"SELECT * FROM documents {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
@@ -1051,22 +1079,59 @@ class PostgresBackend(DBBackend):
         finally:
             cur.close()
 
+    # Every DocumentRecord column that is physically stored, in INSERT order.
+    # LIVE-BUG FIX: this INSERT used to list only the 21 round-3 columns, so
+    # on PostgreSQL register_intake() silently dropped extracted_text,
+    # source_format, uploaded_*, original_filename, retry_count and
+    # intake_batch_id -- the document registered fine and then failed at
+    # processing with "No extracted text stored". SQLite persisted them,
+    # which is why the SQLite-backed suites never saw it. Columns 22+ require
+    # migrations/0002 and 0003 to have been applied (deploy/migrate.sh does).
+    _DOC_INSERT_COLUMNS = (
+        "document_id", "source_id", "title", "authors", "journal", "publication_date",
+        "doi", "pmid", "trial_id", "cmt_subtypes", "genes", "study_type", "source_tier",
+        "source_url", "internal_storage_path", "discovery_candidate_id",
+        "ingestion_method", "approval_status", "approved_by", "approved_at",
+        "knowledge_version",
+        "source_format", "uploaded_by", "uploaded_at", "original_filename",
+        "extracted_text", "retry_count", "intake_batch_id",
+        "content_type", "source_mime_type", "source_content_hash",
+        "source_document_ref", "extraction_status",
+    )
+
+    @staticmethod
+    def _doc_insert_values(doc: DocumentRecord) -> tuple:
+        status = doc.approval_status.value if isinstance(doc.approval_status, IngestionState) else doc.approval_status
+        return (
+            doc.document_id, doc.source_id, doc.title, doc.authors, doc.journal,
+            doc.publication_date, doc.doi, doc.pmid, doc.trial_id, doc.cmt_subtypes,
+            doc.genes, doc.study_type, doc.source_tier, doc.source_url,
+            doc.internal_storage_path, doc.discovery_candidate_id, doc.ingestion_method,
+            status, doc.approved_by, doc.approved_at, doc.knowledge_version,
+            doc.source_format, doc.uploaded_by, doc.uploaded_at, doc.original_filename,
+            doc.extracted_text, doc.retry_count, doc.intake_batch_id,
+            doc.content_type or "research_paper", doc.source_mime_type,
+            doc.source_content_hash, doc.source_document_ref, doc.extraction_status,
+        )
+
     def create_document(self, doc: DocumentRecord) -> None:
+        cols = self._DOC_INSERT_COLUMNS
+        sql = (
+            f"INSERT INTO cmt_veda_rag.documents ({', '.join(cols)}) "
+            f"VALUES ({', '.join(['%s'] * len(cols))})"
+        )
         with self._cursor() as cur:
-            cur.execute(
-                """INSERT INTO cmt_veda_rag.documents
-                (document_id, source_id, title, authors, journal, publication_date,
-                 doi, pmid, trial_id, cmt_subtypes, genes, study_type, source_tier,
-                 source_url, internal_storage_path, discovery_candidate_id,
-                 ingestion_method, approval_status, approved_by, approved_at,
-                 knowledge_version)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                (doc.document_id, doc.source_id, doc.title, doc.authors, doc.journal,
-                 doc.publication_date, doc.doi, doc.pmid, doc.trial_id, doc.cmt_subtypes,
-                 doc.genes, doc.study_type, doc.source_tier, doc.source_url,
-                 doc.internal_storage_path, doc.discovery_candidate_id, doc.ingestion_method,
-                 doc.approval_status.value, doc.approved_by, doc.approved_at, doc.knowledge_version),
-            )
+            cur.execute(sql, self._doc_insert_values(doc))
+
+    @staticmethod
+    def _row_to_document(row) -> DocumentRecord:
+        """RealDictCursor row -> DocumentRecord. Unknown columns (e.g. a
+        newer migration than this code) are ignored instead of raising
+        TypeError, and the approval_status enum is converted."""
+        data = dict(row)
+        data["approval_status"] = IngestionState(data["approval_status"])
+        known = {f.name for f in dataclasses.fields(DocumentRecord)}
+        return DocumentRecord(**{k: v for k, v in data.items() if k in known})
 
     def get_document(self, document_id: str) -> Optional[DocumentRecord]:
         with self._cursor() as cur:
@@ -1074,9 +1139,7 @@ class PostgresBackend(DBBackend):
             row = cur.fetchone()
         if not row:
             return None
-        row = dict(row)
-        row["approval_status"] = IngestionState(row["approval_status"])
-        return DocumentRecord(**row)
+        return self._row_to_document(row)
 
     def find_duplicate(self, doi: str, pmid: str, title: str) -> Optional[DocumentRecord]:
         with self._cursor() as cur:
@@ -1084,14 +1147,12 @@ class PostgresBackend(DBBackend):
                 cur.execute("SELECT * FROM cmt_veda_rag.documents WHERE doi = %s", (doi,))
                 row = cur.fetchone()
                 if row:
-                    row = dict(row); row["approval_status"] = IngestionState(row["approval_status"])
-                    return DocumentRecord(**row)
+                    return self._row_to_document(row)
             if pmid:
                 cur.execute("SELECT * FROM cmt_veda_rag.documents WHERE pmid = %s", (pmid,))
                 row = cur.fetchone()
                 if row:
-                    row = dict(row); row["approval_status"] = IngestionState(row["approval_status"])
-                    return DocumentRecord(**row)
+                    return self._row_to_document(row)
         return None
 
     def transition_document_state(self, document_id: str, new_state: IngestionState, actor: str) -> DocumentRecord:
@@ -1125,8 +1186,7 @@ class PostgresBackend(DBBackend):
             rows = cur.fetchall()
         out = []
         for row in rows:
-            row = dict(row); row["approval_status"] = IngestionState(row["approval_status"])
-            out.append(DocumentRecord(**row))
+            out.append(self._row_to_document(row))
         return out
 
     def next_source_id(self) -> str:
@@ -1243,9 +1303,8 @@ class PostgresBackend(DBBackend):
             rows = cur.fetchall()
         out = {}
         for row in rows:
-            row = dict(row)
-            row["approval_status"] = IngestionState(row["approval_status"])
-            out[str(row["document_id"])] = DocumentRecord(**row)
+            doc = self._row_to_document(row)
+            out[str(doc.document_id)] = doc
         return out
 
     def create_discovery_candidate(self, discovery_candidate_id, proposed_title, proposed_source_url) -> None:
@@ -1285,6 +1344,8 @@ class PostgresBackend(DBBackend):
     _INTAKE_EXTRA_COLUMNS = {
         "source_format", "uploaded_by", "uploaded_at", "original_filename",
         "extracted_text", "intake_batch_id",
+        "content_type", "source_mime_type", "source_content_hash",
+        "source_document_ref", "extraction_status",
     }
 
     def set_intake_extras(self, document_id: str, **fields) -> None:
@@ -1326,7 +1387,8 @@ class PostgresBackend(DBBackend):
 
     def list_documents_page(self, state: Optional[IngestionState] = None,
                              source_type: Optional[str] = None,
-                             limit: int = 50, offset: int = 0) -> list[DocumentRecord]:
+                             limit: int = 50, offset: int = 0,
+                             content_type: Optional[str] = None) -> list[DocumentRecord]:
         clauses, params = [], []
         if state is not None:
             clauses.append("approval_status = %s")
@@ -1336,6 +1398,9 @@ class PostgresBackend(DBBackend):
                 clauses.append("ingestion_method = 'discovery'")
             else:
                 clauses.append("ingestion_method != 'discovery'")
+        if content_type is not None:
+            clauses.append("content_type = %s")
+            params.append(content_type)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         with self._cursor() as cur:
             cur.execute(
@@ -1345,8 +1410,7 @@ class PostgresBackend(DBBackend):
             rows = cur.fetchall()
         out = []
         for row in rows:
-            row = dict(row); row["approval_status"] = IngestionState(row["approval_status"])
-            out.append(DocumentRecord(**row))
+            out.append(self._row_to_document(row))
         return out
 
     def create_intake_batch(self, batch_id: str, batch_type: str, created_by: str, item_count: int) -> None:

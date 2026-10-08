@@ -743,3 +743,46 @@ is covered by a new passing test
 (`test_illegal_transition_is_a_distinct_error_type_not_generic_valueerror`).
 No other contradiction was found between router paths, Pydantic
 models, `intake.py`, `db.py`, the migration, and the test suite.
+
+
+---
+
+## Addendum A — post-integration changes (additive; the Round 4 contract above is otherwise unchanged)
+
+**A.1 Route order (bug fix).** `POST /admin/intake/bulk` and `POST /admin/intake/bulk/approve` are declared
+before the dynamic `/{document_id}/...` routes, and `bulk` / `pdf` are reserved path segments: they can
+never be interpreted as a `document_id` (a request that would fall through to a dynamic handler with a
+reserved segment gets `404`). Previously `POST /admin/intake/bulk/approve` was captured by
+`POST /admin/intake/{document_id}/approve` and failed with `500` on PostgreSQL (`invalid input syntax for
+type uuid: "bulk"`). Request/response bodies of both endpoints are unchanged.
+
+**A.2 Scientific content class (`content_type`) — new optional field, orthogonal to `source_type`.**
+`source_type` (`discovery` | `direct_upload`) says how a document arrived; `content_type` says what kind of
+evidence it is. Allowed: `research_paper` (default — existing clients are unaffected), `clinical_trial`,
+`genetic_variant`, `guideline`, `consensus_statement`, `outcome_measure`. Anything else → `422`
+(`newsletter_*` content is not a RAG source and has no content type).
+- Accepted on `POST /admin/intake`, each bulk item's `payload`, and `POST /admin/intake/pdf` (form field).
+- Returned on every intake response; filterable with `GET /admin/intake?content_type=...`.
+- The full-text floor (`RAG_MIN_FULL_TEXT_CHARS`) applies to literature-style classes (`research_paper`,
+  `guideline`, `consensus_statement`, `outcome_measure`). Structured records (`clinical_trial`,
+  `genetic_variant`) are exempt — they are registry/database records, not the full text of a paper — but the
+  50-character corrupted-content floor still applies.
+- Ask Veda evidence blocks carry `source_kind: <content_type>` and the grounding rules require attributing
+  claims to the right kind of source ("ClinVar classifies…" ≠ "a study reports…").
+
+**A.3 Source provenance — new optional fields** on register requests (and returned on responses):
+`source_format` (`pdf`|`xml`|`html`|`text`|`markdown` — the ORIGINAL representation; defaults to `format`),
+`source_mime_type`, `source_content_hash`, `source_document_ref`, `extraction_status`. `source_url` and
+`discovery_candidate_id` are unchanged. RAG indexes the **extracted text** whatever the origin:
+XML- and HTML-derived scientific text is as valid as PDF, and `pdf_available` is never required.
+
+**A.4 No content truncation in RAG.** `raw_text` is stored and chunked in full (no character cap other
+than the 50 MB PDF-upload byte limit and normal HTTP body limits). Over-long paragraphs are split on
+sentence/whitespace boundaries so no chunk exceeds `MAX_CHUNK_CHARS`. Entity extraction scans the whole text.
+
+**A.5 Idempotent repair.** Re-registering a source whose existing duplicate is still `pending_approval`
+with an empty `extracted_text` (left by the PostgreSQL insert bug below) fills the text/provenance in place
+and returns the same `document_id`/`source_id`; no state change, no approval bypass. Any other duplicate is
+still `409`.
+
+**A.6 Migration `0003_scientific_taxonomy_provenance.sql`** (idempotent; applied by `deploy/migrate.sh`).

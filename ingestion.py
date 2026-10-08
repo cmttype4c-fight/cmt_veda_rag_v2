@@ -148,9 +148,56 @@ def split_into_sections(full_text: str) -> list[tuple[str, str]]:
     return sections
 
 
+_SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9(\[])")
+
+
+def _split_oversize_piece(piece: str, limit: int) -> list[str]:
+    """Split ONE paragraph that is longer than `limit` without losing any
+    text: first on sentence boundaries, then (for a "sentence" that is still
+    too long, e.g. a table dump or text with no punctuation) on whitespace,
+    and only as a last resort mid-token. Previously such a paragraph became a
+    single multi-thousand-character chunk, which the embedder then silently
+    truncated -- most of a long XML-derived paper (often one block of text)
+    would never have been searchable."""
+    if len(piece) <= limit:
+        return [piece]
+    out, current = [], ""
+    for sentence in _SENTENCE_END_RE.split(piece):
+        if len(sentence) > limit:
+            if current:
+                out.append(current)
+                current = ""
+            words, line = sentence.split(), ""
+            for w in words:
+                if len(w) > limit:                      # no whitespace at all: hard wrap
+                    if line:
+                        out.append(line)
+                        line = ""
+                    out.extend(w[i:i + limit] for i in range(0, len(w), limit))
+                elif len(line) + len(w) + 1 <= limit:
+                    line = f"{line} {w}".strip()
+                else:
+                    out.append(line)
+                    line = w
+            if line:
+                out.append(line)
+        elif len(current) + len(sentence) + 1 <= limit:
+            current = f"{current} {sentence}".strip()
+        else:
+            if current:
+                out.append(current)
+            current = sentence
+    if current:
+        out.append(current)
+    return out
+
+
 def _chunk_long_section(section_name: str, text: str) -> list[str]:
-    """Break an over-long section into ~MAX_CHUNK_CHARS pieces on paragraph
-    boundaries so we never split mid-sentence/mid-table where avoidable."""
+    """Break an over-long section into pieces of at most ~MAX_CHUNK_CHARS on
+    paragraph boundaries (then sentence / whitespace boundaries for a single
+    over-long paragraph) so we never split mid-sentence/mid-table where
+    avoidable AND never drop or oversize any text. The whole section is always
+    covered: nothing is truncated."""
     if len(text) <= MAX_CHUNK_CHARS:
         return [text]
     paragraphs = re.split(r"\n\s*\n", text)
@@ -161,7 +208,13 @@ def _chunk_long_section(section_name: str, text: str) -> list[str]:
         else:
             if current:
                 chunks.append(current)
-            current = para
+                current = ""
+            if len(para) > MAX_CHUNK_CHARS:
+                pieces = _split_oversize_piece(para, MAX_CHUNK_CHARS)
+                chunks.extend(pieces[:-1])
+                current = pieces[-1]
+            else:
+                current = para
     if current:
         chunks.append(current)
     return chunks or [text]

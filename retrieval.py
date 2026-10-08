@@ -285,6 +285,7 @@ class HybridRetriever:
                 "doi": doc.doi if doc else "",
                 "study_type": doc.study_type if doc else "",
                 "source_url": doc.source_url if doc else "",
+                "content_type": getattr(doc, "content_type", "research_paper") if doc else "research_paper",
             } if doc else {}
         return self._doc_metadata_cache[document_id]
 

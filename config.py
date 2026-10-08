@@ -257,6 +257,13 @@ RAG_POSTGRES_DSN = os.environ.get("RAG_POSTGRES_DSN", "")
 # first time, plus the faiss package); "hashing_tfidf"+"numpy" is the
 # dependency-free local substitute used for testing in this sandbox.
 RAG_EMBEDDING_BACKEND = os.environ.get("RAG_EMBEDDING_BACKEND", "hashing_tfidf")
+# Optional: raise the sentence-transformers max sequence length (tokens).
+# Unset (0) keeps the model default, which for all-MiniLM-L6-v2 is 256 tokens
+# (~1000 characters) -- shorter than our 1800-character chunks, so the tail of
+# a long chunk is not reflected in its vector (lexical search still covers it).
+# The model supports up to 512. Changing this changes newly computed vectors
+# only; re-index to apply it uniformly.
+RAG_EMBEDDING_MAX_SEQ_LENGTH = int(os.environ.get("RAG_EMBEDDING_MAX_SEQ_LENGTH", "0"))
 RAG_VECTOR_BACKEND = os.environ.get("RAG_VECTOR_BACKEND", "numpy")
 RAG_VECTOR_STORE_PATH = os.environ.get("RAG_VECTOR_STORE_PATH", "./vector_store")
 
@@ -291,6 +298,36 @@ ALLOWED_SOURCE_TYPES = {"discovery", "direct_upload"}
 # at all) at the backend level per the brief's explicit instruction not to
 # rely on the UI alone.
 MIN_FULL_TEXT_CHARS = int(os.environ.get("RAG_MIN_FULL_TEXT_CHARS", "1000"))
+
+# ---------------------------------------------------------------------
+# SCIENTIFIC KNOWLEDGE BASE: content classes (additive; orthogonal to
+# source_type). `source_type` ('discovery' | 'direct_upload') says HOW a
+# document arrived; `content_type` says WHAT KIND of scientific evidence it
+# is. They must never be conflated, and a clinical-trial record or a ClinVar
+# variant must never be presented as a research paper. Ask Veda needs the
+# distinction to say "ClinVar classifies this variant as ..." rather than
+# "a paper reports ...".
+# ---------------------------------------------------------------------
+DEFAULT_CONTENT_TYPE = "research_paper"
+CONTENT_TYPES = (
+    "research_paper",        # scientific literature: original studies, reviews, case reports, natural history
+    "clinical_trial",        # trial registry records (e.g. ClinicalTrials.gov) -- structured, NOT a paper
+    "genetic_variant",       # authoritative genomic records (e.g. ClinVar, OMIM) -- a classification, NOT a paper
+    "guideline",             # clinical guidelines
+    "consensus_statement",   # consensus statements
+    "outcome_measure",       # outcome-measure documentation
+)
+# Literature-style content must be genuine full text (the MIN_FULL_TEXT_CHARS
+# floor above applies). Structured records (a trial record, a variant
+# classification) are legitimately short and are exempt from that floor --
+# they are not, and must not be treated as, the full text of a paper.
+FULL_TEXT_REQUIRED_CONTENT_TYPES = frozenset(
+    {"research_paper", "guideline", "consensus_statement", "outcome_measure"}
+)
+STRUCTURED_CONTENT_TYPES = frozenset({"clinical_trial", "genetic_variant"})
+# Original representation of the source (provenance). The RAG always works
+# from the EXTRACTED TEXT, whatever this is; XML and HTML are as valid as PDF.
+ALLOWED_SOURCE_FORMATS = frozenset({"pdf", "xml", "html", "text", "markdown"})
 
 # Retry policy (brief §12, your confirmed decision: 5 attempts, exponential
 # backoff). PostgreSQL (documents.retry_count, processing_jobs) is the

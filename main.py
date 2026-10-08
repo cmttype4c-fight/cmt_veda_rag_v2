@@ -29,10 +29,10 @@ import threading
 import uuid
 from pathlib import Path
 from contextlib import asynccontextmanager
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional
 import secrets
 
-from fastapi import FastAPI, HTTPException, Header, APIRouter, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Header, APIRouter, UploadFile, File, Form, Depends, Path
 from pydantic import BaseModel
 
 import config
@@ -807,6 +807,22 @@ def ingestion_status(document_id: str, x_admin_api_key: Optional[str] = Header(d
 # ---------------------------------------------------------------------
 intake_router = APIRouter(prefix="/admin/intake")
 
+# Path segments that are fixed routes, never document ids. Defence in depth
+# behind the declaration order above: if a static route is ever shadowed or a
+# non-existent static path is requested (e.g. POST /admin/intake/bulk/retry),
+# the caller gets a clean 404 instead of "bulk" reaching the database as an id.
+_RESERVED_INTAKE_SEGMENTS = frozenset({"bulk", "pdf"})
+
+
+def _intake_document_id(document_id: str = Path(...)) -> str:
+    if document_id in _RESERVED_INTAKE_SEGMENTS:
+        raise HTTPException(status_code=404, detail="Not found.")
+    return document_id
+
+
+IntakeDocumentId = Annotated[str, Depends(_intake_document_id)]
+
+
 
 def _enqueue_and_drain(fn, *args, **kwargs):
     """Calls an intake.py function that needs an enqueue_fn, using
@@ -855,6 +871,9 @@ def _doc_to_intake_response(doc) -> "IntakeDocumentResponse":
         retry_count=doc.retry_count, intake_batch_id=_as_str(doc.intake_batch_id),
         approved_by=doc.approved_by, approved_at=_as_str(doc.approved_at),
         created_at=_as_str(doc.created_at), updated_at=_as_str(doc.updated_at),
+        content_type=doc.content_type, source_mime_type=doc.source_mime_type,
+        source_content_hash=doc.source_content_hash, source_document_ref=doc.source_document_ref,
+        extraction_status=doc.extraction_status,
     )
 
 
@@ -886,6 +905,12 @@ class IntakeDocumentResponse(BaseModel):
     approved_at: Optional[str] = None
     created_at: str
     updated_at: str
+    # additive (scientific taxonomy + provenance); older clients ignore them
+    content_type: str = "research_paper"
+    source_mime_type: str = ""
+    source_content_hash: str = ""
+    source_document_ref: str = ""
+    extraction_status: str = ""
 
 
 class IntakeJobResponse(IntakeDocumentResponse):
@@ -912,11 +937,21 @@ class IntakeRegisterRequest(BaseModel):
     knowledge_version: Optional[str] = None
     uploaded_by: Optional[str] = None
     original_filename: str = ""
+    # additive: scientific class + provenance of the ORIGINAL source. `format`
+    # above is the format of raw_text; `source_format` is what it was extracted
+    # from (pdf/xml/html/text/markdown) -- XML/HTML-derived text is as valid as PDF.
+    content_type: str = "research_paper"
+    source_format: str = ""
+    source_mime_type: str = ""
+    source_content_hash: str = ""
+    source_document_ref: str = ""
+    extraction_status: str = ""
     actor: str
 
 
 def _intake_exc_to_http(e: Exception):
-    if isinstance(e, intake.InvalidSourceType) or isinstance(e, intake.FullTextRuleViolation) \
+    if isinstance(e, (intake.InvalidSourceType, intake.InvalidContentType)) \
+            or isinstance(e, intake.FullTextRuleViolation) \
             or isinstance(e, IngestionValidationError):
         return HTTPException(status_code=422, detail=str(e))
     # IllegalStateTransitionError IS a ValueError (see config.py) -- this
@@ -969,6 +1004,7 @@ async def intake_register_pdf(
     source_tier: str = Form("unspecified"),
     source_url: str = Form(""),
     discovery_candidate_id: Optional[str] = Form(None),
+    content_type: str = Form("research_paper"),
     x_admin_api_key: Optional[str] = Header(default=None, alias="X-Admin-API-Key"),
 ):
     """DISCOVERED -> PENDING_APPROVAL for a PDF upload. Same extraction
@@ -986,6 +1022,7 @@ async def intake_register_pdf(
         genes=[g.strip() for g in genes_csv.split(",") if g.strip()],
         study_type=study_type, source_tier=source_tier, source_url=source_url,
         discovery_candidate_id=discovery_candidate_id,
+        content_type=content_type, source_format="pdf", source_mime_type="application/pdf",
     )
     try:
         doc = intake.register_intake(
@@ -1000,10 +1037,55 @@ async def intake_register_pdf(
     return _doc_to_intake_response(doc)
 
 
+# ---- ROUTE ORDER MATTERS (live bug fix) -----------------------------------
+# FastAPI matches routes in declaration order. The static "/bulk" and
+# "/bulk/approve" routes MUST be declared before the dynamic
+# "/{document_id}/..." routes, otherwise POST /admin/intake/bulk/approve is
+# captured by POST /admin/intake/{document_id}/approve with
+# document_id="bulk" (a 500 on PostgreSQL: invalid input syntax for type
+# uuid: "bulk"). test_intake_routing.py pins this. Any new static segment
+# under /admin/intake must also be added to _RESERVED_INTAKE_SEGMENTS.
+@intake_router.post("/bulk", response_model=IntakeBulkResultResponse)
+def intake_bulk_register(payload: IntakeBulkRegisterRequest,
+                          x_admin_api_key: Optional[str] = Header(default=None, alias="X-Admin-API-Key")):
+    """Confirmed decision #3: one failed document in the batch must not
+    roll back or incorrectly mark others as successful -- intake.
+    bulk_register_intake() loops with a per-item try/except, never one
+    wrapping transaction, so this is structurally true rather than
+    merely tested to be true."""
+    require_admin_key(x_admin_api_key)
+    db = state["db"]
+    items = [item.model_dump() for item in payload.items]
+    result = intake.bulk_register_intake(db, items, actor=payload.actor)
+    logger.info("AUDIT admin intake_bulk_register batch_id=%s actor=%s success=%s failure=%s",
+                result["batch_id"], payload.actor, result.get("success_count"), result.get("failure_count"))
+    return IntakeBulkResultResponse(**result)
+
+
+class IntakeBulkApproveRequest(BaseModel):
+    document_ids: list[str]
+    actor: str
+
+
+@intake_router.post("/bulk/approve", response_model=IntakeBulkResultResponse)
+def intake_bulk_approve(payload: IntakeBulkApproveRequest,
+                         x_admin_api_key: Optional[str] = Header(default=None, alias="X-Admin-API-Key")):
+    """pending_approval -> approved -> queued for each id (approval
+    auto-queues, same as the single-item path -- no separate bulk/queue
+    endpoint, per confirmed decision #3)."""
+    require_admin_key(x_admin_api_key)
+    db = state["db"]
+    result = _enqueue_and_drain(intake.bulk_approve_intake, db, payload.document_ids, actor=payload.actor)
+    logger.info("AUDIT admin intake_bulk_approve batch_id=%s actor=%s success=%s failure=%s",
+                result["batch_id"], payload.actor, result.get("success_count"), result.get("failure_count"))
+    return IntakeBulkResultResponse(**result)
+
+
 @intake_router.get("", response_model=list[IntakeDocumentResponse])
 def intake_list(
     state_filter: Optional[str] = None,
     source_type: Optional[Literal["discovery", "direct_upload"]] = None,
+    content_type: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
     x_admin_api_key: Optional[str] = Header(default=None, alias="X-Admin-API-Key"),
@@ -1016,13 +1098,15 @@ def intake_list(
             ingestion_state = IngestionState(state_filter)
         except ValueError:
             raise HTTPException(status_code=422, detail=f"Unknown state: {state_filter!r}")
+    if content_type is not None and content_type not in config.CONTENT_TYPES:
+        raise HTTPException(status_code=422, detail=f"Unknown content_type: {content_type!r}")
     docs = db.list_documents_page(state=ingestion_state, source_type=source_type,
-                                   limit=limit, offset=offset)
+                                   limit=limit, offset=offset, content_type=content_type)
     return [_doc_to_intake_response(d) for d in docs]
 
 
 @intake_router.get("/{document_id}", response_model=IntakeDocumentResponse)
-def intake_get(document_id: str, x_admin_api_key: Optional[str] = Header(default=None, alias="X-Admin-API-Key")):
+def intake_get(document_id: IntakeDocumentId, x_admin_api_key: Optional[str] = Header(default=None, alias="X-Admin-API-Key")):
     require_admin_key(x_admin_api_key)
     doc = state["db"].get_document(document_id)
     if doc is None:
@@ -1043,7 +1127,7 @@ class IntakePatchRequest(BaseModel):
 
 
 @intake_router.patch("/{document_id}", response_model=IntakeDocumentResponse)
-def intake_patch(document_id: str, payload: IntakePatchRequest,
+def intake_patch(document_id: IntakeDocumentId, payload: IntakePatchRequest,
                   x_admin_api_key: Optional[str] = Header(default=None, alias="X-Admin-API-Key")):
     """Metadata correction (confirmed decision #2) -- allowed ONLY while
     pending_approval, never after, to preserve the audit trail of what
@@ -1067,7 +1151,7 @@ class IntakeRejectRequest(BaseModel):
 
 
 @intake_router.post("/{document_id}/reject", response_model=IntakeDocumentResponse)
-def intake_reject(document_id: str, payload: IntakeRejectRequest,
+def intake_reject(document_id: IntakeDocumentId, payload: IntakeRejectRequest,
                    x_admin_api_key: Optional[str] = Header(default=None, alias="X-Admin-API-Key")):
     require_admin_key(x_admin_api_key)
     db = state["db"]
@@ -1085,7 +1169,7 @@ class IntakeActorRequest(BaseModel):
 
 
 @intake_router.post("/{document_id}/approve", response_model=IntakeJobResponse)
-def intake_approve(document_id: str, payload: IntakeActorRequest,
+def intake_approve(document_id: IntakeDocumentId, payload: IntakeActorRequest,
                     x_admin_api_key: Optional[str] = Header(default=None, alias="X-Admin-API-Key")):
     """PENDING_APPROVAL -> APPROVED -> QUEUED in one call (confirmed
     decision #1: approval auto-queues). Returns the queued state plus the
@@ -1105,7 +1189,7 @@ def intake_approve(document_id: str, payload: IntakeActorRequest,
 
 
 @intake_router.post("/{document_id}/retry", response_model=IntakeJobResponse)
-def intake_retry(document_id: str, payload: IntakeActorRequest,
+def intake_retry(document_id: IntakeDocumentId, payload: IntakeActorRequest,
                   x_admin_api_key: Optional[str] = Header(default=None, alias="X-Admin-API-Key")):
     """FAILED -> QUEUED: the explicit admin retry confirmed decision #4
     requires once a document has exhausted MAX_RETRIES automatic
@@ -1145,42 +1229,6 @@ class IntakeBulkResultResponse(BaseModel):
     success_count: int
     failure_count: int
     results: list[dict]
-
-
-@intake_router.post("/bulk", response_model=IntakeBulkResultResponse)
-def intake_bulk_register(payload: IntakeBulkRegisterRequest,
-                          x_admin_api_key: Optional[str] = Header(default=None, alias="X-Admin-API-Key")):
-    """Confirmed decision #3: one failed document in the batch must not
-    roll back or incorrectly mark others as successful -- intake.
-    bulk_register_intake() loops with a per-item try/except, never one
-    wrapping transaction, so this is structurally true rather than
-    merely tested to be true."""
-    require_admin_key(x_admin_api_key)
-    db = state["db"]
-    items = [item.model_dump() for item in payload.items]
-    result = intake.bulk_register_intake(db, items, actor=payload.actor)
-    logger.info("AUDIT admin intake_bulk_register batch_id=%s actor=%s success=%s failure=%s",
-                result["batch_id"], payload.actor, result.get("success_count"), result.get("failure_count"))
-    return IntakeBulkResultResponse(**result)
-
-
-class IntakeBulkApproveRequest(BaseModel):
-    document_ids: list[str]
-    actor: str
-
-
-@intake_router.post("/bulk/approve", response_model=IntakeBulkResultResponse)
-def intake_bulk_approve(payload: IntakeBulkApproveRequest,
-                         x_admin_api_key: Optional[str] = Header(default=None, alias="X-Admin-API-Key")):
-    """pending_approval -> approved -> queued for each id (approval
-    auto-queues, same as the single-item path -- no separate bulk/queue
-    endpoint, per confirmed decision #3)."""
-    require_admin_key(x_admin_api_key)
-    db = state["db"]
-    result = _enqueue_and_drain(intake.bulk_approve_intake, db, payload.document_ids, actor=payload.actor)
-    logger.info("AUDIT admin intake_bulk_approve batch_id=%s actor=%s success=%s failure=%s",
-                result["batch_id"], payload.actor, result.get("success_count"), result.get("failure_count"))
-    return IntakeBulkResultResponse(**result)
 
 
 app.include_router(intake_router)
