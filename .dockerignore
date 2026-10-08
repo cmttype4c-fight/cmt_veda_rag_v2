@@ -8,13 +8,15 @@ deploy/*.env
 *.pem
 *.key
 *.gguf
-models/
+/models
 __pycache__/
 *.pyc
 .pytest_cache/
 *.db
-vector_store*/
-faiss_index/
+# Anchored on purpose: Docker strips a trailing '/', so 'vector_store*/'
+# would also exclude the source file vector_store.py.
+/vector_store
+/faiss_index
 *.vecs.npy
 *.ids.json
 benchmark_report.json

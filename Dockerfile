@@ -42,5 +42,8 @@ WORKDIR /app
 COPY --chown=rag:rag . /app
 RUN chmod +x /app/deploy/*.sh
 USER rag
+# Build-time guards: a packaging mistake must fail the BUILD, not crash-loop the container.
+RUN python deploy/check_modules.py /app \
+ && python -c "import vector_store, config, runtime_setup; print(vector_store.__file__)"
 EXPOSE 8000
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
