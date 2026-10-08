@@ -12,6 +12,9 @@ adm() { curl -fsS -H "X-Admin-API-Key: $RAG_ADMIN_API_KEY" -H 'Content-Type: app
 state() { adm "$BASE/admin/intake/$ID" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["state"], d.get("content_type"), d.get("source_format"), sep=" | ")'; }
 
 echo "before : $(state)"
+LEN=$(adm "$BASE/admin/intake/$ID" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("extracted_text_length",0))')
+echo "text   : extracted_text_length=$LEN"
+[ "$LEN" -gt 0 ] || { echo "REFUSING: extracted text is empty. Have Veda re-send the register call (no allow_duplicate); it repairs this record in place."; exit 1; }
 if state | grep -q '^pending_approval'; then
   adm -X POST "$BASE/admin/intake/$ID/approve" -d '{"actor":"live-verification"}' >/dev/null
   echo "approve: requested"

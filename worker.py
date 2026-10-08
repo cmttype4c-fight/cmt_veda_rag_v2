@@ -23,6 +23,7 @@ raises; whether/when to re-queue after a failure is a scheduling decision
 that belongs next to the thing that actually talks to a queue.
 """
 
+import logging
 import uuid
 from typing import Optional
 
@@ -34,6 +35,13 @@ from db import DBBackend
 from embeddings import EmbeddingBackend
 from vector_store import VectorStore
 import intake
+from config import IllegalStateTransitionError
+from ingestion_pipeline import IngestionValidationError
+
+logger = logging.getLogger("cmt-veda-ai")
+
+# Errors that will fail identically on every attempt -> never auto-retried.
+_NON_RETRYABLE = (IngestionValidationError, intake.IntakeError, IllegalStateTransitionError)
 
 
 # ---------------------------------------------------------------------
@@ -55,8 +63,20 @@ def process_intake_job(
     document FAILED for an explicit admin retry (brief: 'do not create an
     infinite automatic retry loop'). `enqueue_fn` is threaded through so a
     retry re-enters the SAME queue, real or inline."""
+    row = db.get_processing_job(rq_job_id)
+    if row is not None and row.get("status") == "cancelled":
+        # A stale job (e.g. a delayed retry still in Redis) for a document that
+        # was repaired/reset. PostgreSQL is the authoritative ledger: do nothing.
+        logger.info("skipping cancelled job %s for document %s", rq_job_id, document_id)
+        return
     try:
         intake.process_intake(db, embedder, vector_store, document_id, rq_job_id)
+    except _NON_RETRYABLE as exc:
+        # Deterministic defects (no extracted text, validation failure, illegal
+        # state) fail the same way every time: retrying 5x only burns the retry
+        # budget (this is how CMT-RAG-000034 reached 6/5). The document stays
+        # FAILED with the reason recorded; an admin fixes the cause, then retries.
+        logger.warning("non-retryable failure for document %s: %s", document_id, exc)
     except Exception:
         if attempt < MAX_RETRIES:
             # Real RQ path: schedule the retry `retry_backoff_seconds(attempt)`

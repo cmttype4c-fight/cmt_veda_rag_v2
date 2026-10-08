@@ -875,6 +875,7 @@ def _doc_to_intake_response(doc) -> "IntakeDocumentResponse":
         content_type=doc.content_type, source_mime_type=doc.source_mime_type,
         source_content_hash=doc.source_content_hash, source_document_ref=doc.source_document_ref,
         extraction_status=doc.extraction_status,
+        extracted_text_length=len(doc.extracted_text or ""),
     )
 
 
@@ -912,6 +913,7 @@ class IntakeDocumentResponse(BaseModel):
     source_content_hash: str = ""
     source_document_ref: str = ""
     extraction_status: str = ""
+    extracted_text_length: int = 0   # characters of stored extracted text (0 = unprocessable; see repair)
 
 
 class IntakeJobResponse(IntakeDocumentResponse):
@@ -960,7 +962,8 @@ def _intake_exc_to_http(e: Exception):
     # below, or "document exists but is in the wrong state" (e.g.
     # approving an already-INDEXED document, retrying a non-FAILED one)
     # gets mislabeled as "no such document".
-    if isinstance(e, (DuplicateDocumentError, intake.IntakeConflictError, IllegalStateTransitionError)):
+    if isinstance(e, (DuplicateDocumentError, intake.IntakeConflictError, intake.MissingExtractedTextError,
+                      IllegalStateTransitionError)):
         return HTTPException(status_code=409, detail=str(e))
     if isinstance(e, ValueError):
         return HTTPException(status_code=404, detail=str(e))

@@ -269,24 +269,32 @@ class HybridRetriever:
         self.vector_store = vector_store
         self._doc_metadata_cache: dict[str, dict] = {}
 
+    @staticmethod
+    def _doc_metadata(doc) -> dict:
+        """The ONE place a document's retrieval metadata dict is built (it used
+        to be duplicated, and content_type was added to only one copy -- so
+        every evidence block was labelled research_paper)."""
+        if not doc:
+            return {}
+        return {
+            "genes": doc.genes,
+            "cmt_subtypes": doc.cmt_subtypes,
+            "source_tier": doc.source_tier,
+            "trial_id": doc.trial_id,
+            "pmid": doc.pmid,
+            "title": doc.title,
+            "authors": doc.authors,
+            "journal": doc.journal,
+            "publication_date": doc.publication_date,
+            "doi": doc.doi,
+            "study_type": doc.study_type,
+            "source_url": doc.source_url,
+            "content_type": getattr(doc, "content_type", None) or "research_paper",
+        }
+
     def _metadata_for_chunk(self, document_id: str) -> dict:
         if document_id not in self._doc_metadata_cache:
-            doc = self.db.get_document(document_id)
-            self._doc_metadata_cache[document_id] = {
-                "genes": doc.genes if doc else [],
-                "cmt_subtypes": doc.cmt_subtypes if doc else [],
-                "source_tier": doc.source_tier if doc else "unspecified",
-                "trial_id": doc.trial_id if doc else "",
-                "pmid": doc.pmid if doc else "",
-                "title": doc.title if doc else "",
-                "authors": doc.authors if doc else [],
-                "journal": doc.journal if doc else "",
-                "publication_date": doc.publication_date if doc else None,
-                "doi": doc.doi if doc else "",
-                "study_type": doc.study_type if doc else "",
-                "source_url": doc.source_url if doc else "",
-                "content_type": getattr(doc, "content_type", "research_paper") if doc else "research_paper",
-            } if doc else {}
+            self._doc_metadata_cache[document_id] = self._doc_metadata(self.db.get_document(document_id))
         return self._doc_metadata_cache[document_id]
 
     def retrieve(self, question: str, k: int = CANDIDATE_POOL_MAX) -> list[Candidate]:
@@ -359,20 +367,7 @@ class HybridRetriever:
         # _metadata_for_chunk() remains correct for other callers,
         # without generating additional DB queries.
         for document_id, doc in documents_by_id.items():
-            self._doc_metadata_cache[document_id] = {
-                "genes": doc.genes if doc else [],
-                "cmt_subtypes": doc.cmt_subtypes if doc else [],
-                "source_tier": doc.source_tier if doc else "unspecified",
-                "trial_id": doc.trial_id if doc else "",
-                "pmid": doc.pmid if doc else "",
-                "title": doc.title if doc else "",
-                "authors": doc.authors if doc else [],
-                "journal": doc.journal if doc else "",
-                "publication_date": doc.publication_date if doc else None,
-                "doi": doc.doi if doc else "",
-                "study_type": doc.study_type if doc else "",
-                "source_url": doc.source_url if doc else "",
-            } if doc else {}
+            self._doc_metadata_cache[document_id] = self._doc_metadata(doc)
 
         candidates: dict[str, Candidate] = {}
 

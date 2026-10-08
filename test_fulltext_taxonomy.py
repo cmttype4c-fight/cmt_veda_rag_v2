@@ -310,6 +310,34 @@ def test_pending_row_with_missing_text_is_repaired_in_place_on_reregister():
         db.close(); shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_retrieved_candidates_carry_their_real_content_type_into_the_prompt():
+    """End to end through the real retriever (not a hand-built Candidate): a
+    genetic_variant must reach the prompt labelled genetic_variant. A duplicated
+    metadata builder once left this silently at the research_paper default."""
+    from retrieval import HybridRetriever
+    from generation import build_messages, PERSONA_INSTRUCTIONS
+    tmp, db, adapter = _env()
+    try:
+        v = _register(db, "NM_001303256.3(MORC2):c.539C>T (p.Thr180Ile). ClinVar classification: pathogenic. "
+                          "Condition: Charcot-Marie-Tooth disease axonal type 2Z. MORC2 variant.",
+                      content_type="genetic_variant")
+        p = _register(db, _long_text(4000))
+        for d in (v, p):
+            intake.approve_intake(db, d.document_id, "admin", adapter.enqueue_fn)
+        adapter.run_pending()
+        r = HybridRetriever(db, adapter.embedder, adapter.vector_store)
+        cands, _, _ = r.retrieve_and_rank("MORC2 p.Thr180Ile ClinVar classification")
+        kinds = {c.source_id: c.metadata.get("content_type") for c in cands}
+        assert kinds.get(v.source_id) == "genetic_variant", kinds
+        assert kinds.get(p.source_id, "research_paper") == "research_paper", kinds
+        msgs, _ = build_messages("q", [c for c in cands if c.source_id == v.source_id],
+                                 next(iter(PERSONA_INSTRUCTIONS)), "detailed", "auto")
+        assert "source_kind: genetic_variant" in msgs[1]["content"]
+        print("PASS: retriever -> prompt carries genetic_variant (end to end, real retriever)")
+    finally:
+        db.close(); shutil.rmtree(tmp, ignore_errors=True)
+
+
 # ------------------------------------------------ PostgreSQL persistence
 class _RecordingCursor:
     def __init__(self): self.calls = []

@@ -281,6 +281,28 @@ class DBBackend(ABC):
     @abstractmethod
     def get_latest_processing_job(self, document_id: str) -> Optional[dict]: ...
 
+    @abstractmethod
+    def get_processing_job(self, rq_job_id: str) -> Optional[dict]: ...
+
+    @abstractmethod
+    def cancel_active_processing_jobs(self, document_id: str, reason: str) -> list:
+        """Marks every non-terminal ('queued'/'started') processing_jobs row for
+        the document 'cancelled' and returns their rq_job_ids. PostgreSQL is the
+        authoritative job ledger: a stale RQ job (including a delayed retry
+        still sitting in Redis) that later wakes up checks its own row, sees
+        'cancelled', and exits without doing anything."""
+        ...
+
+    @abstractmethod
+    def reset_document_for_repair(self, document_id: str, actor: str) -> "DocumentRecord":
+        """Puts a document back to PENDING_APPROVAL, clears approval fields and
+        resets retry_count to 0, and writes an ingestion_audit row. This
+        DELIBERATELY bypasses config._ALLOWED_TRANSITIONS (which stays
+        unchanged for every normal path): it exists only for intake.py's
+        repair of a document whose extracted text was lost, and the caller
+        enforces that precondition. It never marks anything approved."""
+        ...
+
     # -- audit --
     @abstractmethod
     def record_answer_audit(self, persona: str, query_scope: str, knowledge_version: str,
@@ -936,6 +958,39 @@ class SqliteBackend(DBBackend):
         ).fetchone()
         return dict(row) if row else None
 
+    def get_processing_job(self, rq_job_id: str) -> Optional[dict]:
+        row = self._conn.execute("SELECT * FROM processing_jobs WHERE rq_job_id = ?", (rq_job_id,)).fetchone()
+        return dict(row) if row else None
+
+    def cancel_active_processing_jobs(self, document_id: str, reason: str) -> list:
+        with self._conn:
+            ids = [r["rq_job_id"] for r in self._conn.execute(
+                "SELECT rq_job_id FROM processing_jobs WHERE document_id = ? AND status IN ('queued','started')",
+                (document_id,))]
+            self._conn.execute(
+                "UPDATE processing_jobs SET status='cancelled', finished_at=?, error=?"
+                " WHERE document_id = ? AND status IN ('queued','started')",
+                (_now(), reason, document_id),
+            )
+        return ids
+
+    def reset_document_for_repair(self, document_id: str, actor: str) -> "DocumentRecord":
+        doc = self.get_document(document_id)
+        if doc is None:
+            raise ValueError(f"No such document: {document_id}")
+        now = _now()
+        with self._conn:
+            self._conn.execute(
+                "UPDATE documents SET approval_status='pending_approval', approved_by=NULL, approved_at=NULL,"
+                " retry_count=0, updated_at=? WHERE document_id=?", (now, document_id),
+            )
+            self._conn.execute(
+                "INSERT INTO ingestion_audit (document_id, from_state, to_state, actor, occurred_at)"
+                " VALUES (?,?,?,?,?)",
+                (document_id, doc.approval_status.value, "pending_approval", actor, now),
+            )
+        return self.get_document(document_id)
+
     # ---- audit ----
     def record_answer_audit(self, persona, query_scope, knowledge_version,
                              retrieved_chunk_ids, cited_source_ids, insufficient_evidence) -> None:
@@ -1482,6 +1537,37 @@ class PostgresBackend(DBBackend):
             )
             row = cur.fetchone()
         return dict(row) if row else None
+
+    def get_processing_job(self, rq_job_id: str) -> Optional[dict]:
+        with self._cursor() as cur:
+            cur.execute("SELECT * FROM cmt_veda_rag.processing_jobs WHERE rq_job_id = %s", (rq_job_id,))
+            row = cur.fetchone()
+        return dict(row) if row else None
+
+    def cancel_active_processing_jobs(self, document_id: str, reason: str) -> list:
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE cmt_veda_rag.processing_jobs SET status='cancelled', finished_at=now(), error=%s"
+                " WHERE document_id = %s AND status IN ('queued','started') RETURNING rq_job_id",
+                (reason, document_id),
+            )
+            return [r["rq_job_id"] for r in cur.fetchall()]
+
+    def reset_document_for_repair(self, document_id: str, actor: str) -> "DocumentRecord":
+        doc = self.get_document(document_id)
+        if doc is None:
+            raise ValueError(f"No such document: {document_id}")
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE cmt_veda_rag.documents SET approval_status='pending_approval', approved_by=NULL,"
+                " approved_at=NULL, retry_count=0, updated_at=now() WHERE document_id=%s", (document_id,),
+            )
+            cur.execute(
+                "INSERT INTO cmt_veda_rag.ingestion_audit (document_id, from_state, to_state, actor)"
+                " VALUES (%s,%s,'pending_approval',%s)",
+                (document_id, doc.approval_status.value, actor),
+            )
+        return self.get_document(document_id)
 
     def record_answer_audit(self, persona, query_scope, knowledge_version,
                             retrieved_chunk_ids, cited_source_ids, insufficient_evidence) -> None:

@@ -786,3 +786,11 @@ and returns the same `document_id`/`source_id`; no state change, no approval byp
 still `409`.
 
 **A.6 Migration `0003_scientific_taxonomy_provenance.sql`** (idempotent; applied by `deploy/migrate.sh`).
+
+### A.5 Repair of text-less records (additive)
+
+- `POST /admin/intake` for a source that already exists with **empty `extracted_text`** repairs that record in place (same `document_id`/`source_id`, no `allow_duplicate`). Applies to every non-terminal, non-`indexed` state (`discovered`, `pending_approval`, `approved`, `queued`, `processing`, `failed`). The record returns to `pending_approval`; prior approval is cleared (human approval is still required); `retry_count` resets to 0; active `processing_jobs` are marked `cancelled` and stale RQ jobs become no-ops. An `ingestion_audit` row (actor `system:repair-missing-extracted-text`) records it.
+- `indexed` records and genuine duplicates (text present) still return the duplicate response.
+- `IntakeDocumentResponse.extracted_text_length` (int) is new. Approve/queue/retry of a record with no text return **409** (`MissingExtractedTextError`).
+- Permanent errors (validation, intake, illegal-transition) are not auto-retried; transient errors retry up to 5 attempts.
+- Registration reads the row back and fails with 500 if the text did not persist.

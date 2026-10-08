@@ -31,6 +31,7 @@ those constants' docstrings in config.py for the honest caveats on what
 this heuristic does and doesn't catch.
 """
 
+import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Callable, Optional
@@ -69,6 +70,23 @@ class InvalidSourceType(IntakeError):
     pass
 
 
+logger = logging.getLogger("cmt-veda-ai")
+
+
+class MissingExtractedTextError(IntakeError):
+    """The document has no stored extracted text, so it can never be processed.
+    Raised by approve/queue/retry BEFORE any state change, instead of letting
+    the worker fail (and auto-retry) on a deterministic defect. Fix: re-send the
+    source to POST /admin/intake -- register_intake() repairs the row in place."""
+
+
+class IntakePersistenceError(RuntimeError):
+    """The database did not store what register_intake() wrote (read-back
+    mismatch). Deliberately NOT an IntakeError: surfaced as a 500 so a storage
+    defect is loud, rather than silently accepting a document that can never
+    be processed (the live CMT-RAG-000034 failure mode)."""
+
+
 class InvalidContentType(IntakeError):
     """content_type / source_format outside the allowlist (config.CONTENT_TYPES,
     config.ALLOWED_SOURCE_FORMATS). Rejected before any row is created."""
@@ -100,6 +118,52 @@ def _enforce_full_text_only(extracted_text: str, content_type: str = "research_p
             f"abstract-only, editorial, or otherwise non-full-text material. "
             f"RAG accepts genuine scientific full text only."
         )
+
+
+_REPAIRABLE_STATES = frozenset({
+    IngestionState.DISCOVERED, IngestionState.PENDING_APPROVAL, IngestionState.APPROVED,
+    IngestionState.QUEUED, IngestionState.PROCESSING, IngestionState.FAILED,
+})
+
+
+def _repair_orphaned_document(db: DBBackend, dup: DocumentRecord, *, extracted_text: str,
+                              source_format: str, content_type: str, payload: IngestionInput) -> DocumentRecord:
+    """Repairs a document whose extracted text was lost (PostgresBackend.
+    create_document used to drop the column), keeping its document_id and
+    source_id. Order matters so a crash midway leaves a state that re-running
+    the same register call repairs again:
+      1. cancel the document's in-flight/delayed jobs (stops the retry chain);
+      2. put it back to PENDING_APPROVAL (audited; retry_count reset; approval
+         cleared -- a human must approve again, nothing is auto-approved);
+      3. write the text and provenance LAST;
+      4. read back and verify.
+    INDEXED / REMOVED documents are never touched here."""
+    document_id = dup.document_id
+    cancelled = db.cancel_active_processing_jobs(
+        document_id, "cancelled: document repaired after its extracted text was found missing")
+    if dup.approval_status == IngestionState.DISCOVERED:
+        db.transition_document_state(document_id, IngestionState.PENDING_APPROVAL, actor="system:repair")
+    elif dup.approval_status == IngestionState.PENDING_APPROVAL:
+        db.set_retry_count(document_id, 0)
+    else:
+        db.reset_document_for_repair(document_id, actor="system:repair-missing-extracted-text")
+    db.set_intake_extras(
+        document_id, extracted_text=extracted_text, source_format=source_format,
+        content_type=content_type, source_mime_type=payload.source_mime_type,
+        source_content_hash=payload.source_content_hash,
+        source_document_ref=payload.source_document_ref,
+        extraction_status=payload.extraction_status,
+    )
+    repaired = db.get_document(document_id)
+    if repaired is None or len((repaired.extracted_text or "").strip()) != len(extracted_text.strip()):
+        raise IntakePersistenceError(
+            f"Repair of {document_id} did not persist extracted_text (stored "
+            f"{len((repaired.extracted_text or '')) if repaired else 'n/a'} of {len(extracted_text)} characters)."
+        )
+    logger.warning(
+        "AUDIT intake_repair document_id=%s source_id=%s from_state=%s cancelled_jobs=%d extracted_chars=%d",
+        document_id, dup.source_id, dup.approval_status.value, len(cancelled), len(extracted_text))
+    return repaired
 
 
 def register_intake(
@@ -154,22 +218,13 @@ def register_intake(
 
     if not allow_duplicate:
         dup = db.find_duplicate(doi=payload.doi, pmid=payload.pmid, title=payload.title)
-        if (dup is not None and dup.approval_status == IngestionState.PENDING_APPROVAL
+        if (dup is not None and dup.approval_status in _REPAIRABLE_STATES
                 and not (dup.extracted_text or "").strip()):
-            # REPAIR, not a duplicate: an earlier PostgresBackend.create_document()
-            # dropped extracted_text (live bug, fixed alongside this), leaving a
-            # pending row that can never be processed. Re-registering the same
-            # source fills in the missing text/provenance IN PLACE -- same
-            # document_id and source_id, still pending_approval, no state change,
-            # no approval bypass -- so the caller just re-sends its register call.
-            db.set_intake_extras(
-                dup.document_id, extracted_text=extracted_text, source_format=source_format,
-                content_type=content_type, source_mime_type=payload.source_mime_type,
-                source_content_hash=payload.source_content_hash,
-                source_document_ref=payload.source_document_ref,
-                extraction_status=payload.extraction_status,
-            )
-            return db.get_document(dup.document_id)
+            # REPAIR, not a duplicate: an unprocessable orphan (see
+            # _repair_orphaned_document). Same document_id / source_id.
+            return _repair_orphaned_document(
+                db, dup, extracted_text=extracted_text, source_format=source_format,
+                content_type=content_type, payload=payload)
         if dup is not None:
             raise DuplicateDocumentError(
                 f"Duplicate of existing document {dup.document_id} "
@@ -208,6 +263,14 @@ def register_intake(
         extracted_text=extracted_text,
     )
     db.create_document(doc)
+    stored = db.get_document(document_id)
+    if stored is None or len(stored.extracted_text or "") != len(extracted_text):
+        raise IntakePersistenceError(
+            f"Document {document_id} (source_id={source_id}) was created but its extracted_text was not "
+            f"persisted ({len((stored.extracted_text or '')) if stored else 'row missing'} of "
+            f"{len(extracted_text)} characters). It is left in 'discovered' and is NOT actionable; "
+            f"re-sending the same source repairs it."
+        )
     db.transition_document_state(document_id, IngestionState.PENDING_APPROVAL, actor="system")
     return db.get_document(document_id)
 
@@ -236,6 +299,15 @@ def reject_intake(db: DBBackend, document_id: str, actor: str, reason: str = "")
     ledger which held no document row pre-approval). Maps onto the
     existing REMOVED terminal state rather than inventing a new one."""
     return db.transition_document_state(document_id, IngestionState.REMOVED, actor=actor)
+
+
+def _require_extracted_text(doc: DocumentRecord) -> None:
+    if not (doc.extracted_text or "").strip():
+        raise MissingExtractedTextError(
+            f"Document {doc.document_id} (source_id={doc.source_id}) has no stored extracted text, so it cannot "
+            f"be approved, queued or retried. Re-send the source via POST /admin/intake to repair it in place "
+            f"(same document_id/source_id), then approve."
+        )
 
 
 def queue_intake(
@@ -267,6 +339,10 @@ def queue_intake(
     caller (main.py) can surface it as a clear 503 rather than a
     misleading "success".
     """
+    current = db.get_document(document_id)
+    if current is None:
+        raise ValueError(f"No such document: {document_id}")
+    _require_extracted_text(current)
     existing = db.get_latest_processing_job(document_id)
     if existing is not None and existing["status"] in ("queued", "started"):
         raise IntakeConflictError(
@@ -299,6 +375,10 @@ def approve_intake(
     it always was — it's just not exposed as its own long-lived admin
     action anymore. The document becomes retrievable only once the worker
     finishes process_intake() and the state reaches INDEXED."""
+    current = db.get_document(document_id)
+    if current is None:
+        raise ValueError(f"No such document: {document_id}")
+    _require_extracted_text(current)   # BEFORE any state change: never approve what can't be processed
     db.transition_document_state(document_id, IngestionState.APPROVED, actor=actor)
     return queue_intake(db, document_id, actor=actor, enqueue_fn=enqueue_fn, attempt=1)
 
