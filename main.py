@@ -32,7 +32,8 @@ from contextlib import asynccontextmanager
 from typing import Annotated, Literal, Optional
 import secrets
 
-from fastapi import FastAPI, HTTPException, Header, APIRouter, UploadFile, File, Form, Depends, Path
+from fastapi import FastAPI, HTTPException, Header, APIRouter, UploadFile, File, Form, Depends
+from fastapi import Path as PathParam   # NOT `Path`: that would shadow pathlib.Path above
 from pydantic import BaseModel
 
 import config
@@ -814,7 +815,7 @@ intake_router = APIRouter(prefix="/admin/intake")
 _RESERVED_INTAKE_SEGMENTS = frozenset({"bulk", "pdf"})
 
 
-def _intake_document_id(document_id: str = Path(...)) -> str:
+def _intake_document_id(document_id: str = PathParam(...)) -> str:
     if document_id in _RESERVED_INTAKE_SEGMENTS:
         raise HTTPException(status_code=404, detail="Not found.")
     return document_id
@@ -1037,6 +1038,29 @@ async def intake_register_pdf(
     return _doc_to_intake_response(doc)
 
 
+# Request/response models for the bulk routes. They MUST be defined before the
+# routes below: decorators and annotations are evaluated at import time.
+class IntakeBulkItem(BaseModel):
+    source_type: Literal["discovery", "direct_upload"]
+    payload: dict
+    uploaded_by: Optional[str] = None
+    original_filename: str = ""
+
+
+class IntakeBulkRegisterRequest(BaseModel):
+    items: list[IntakeBulkItem]
+    actor: str
+
+
+class IntakeBulkResultResponse(BaseModel):
+    batch_id: str
+    batch_type: str
+    item_count: int
+    success_count: int
+    failure_count: int
+    results: list[dict]
+
+
 # ---- ROUTE ORDER MATTERS (live bug fix) -----------------------------------
 # FastAPI matches routes in declaration order. The static "/bulk" and
 # "/bulk/approve" routes MUST be declared before the dynamic
@@ -1208,27 +1232,6 @@ def intake_retry(document_id: IntakeDocumentId, payload: IntakeActorRequest,
                 document_id, payload.actor, job_id, doc.approval_status.value)
     resp = _doc_to_intake_response(doc)
     return IntakeJobResponse(job_id=job_id, **resp.model_dump())
-
-
-class IntakeBulkItem(BaseModel):
-    source_type: Literal["discovery", "direct_upload"]
-    payload: dict
-    uploaded_by: Optional[str] = None
-    original_filename: str = ""
-
-
-class IntakeBulkRegisterRequest(BaseModel):
-    items: list[IntakeBulkItem]
-    actor: str
-
-
-class IntakeBulkResultResponse(BaseModel):
-    batch_id: str
-    batch_type: str
-    item_count: int
-    success_count: int
-    failure_count: int
-    results: list[dict]
 
 
 app.include_router(intake_router)
