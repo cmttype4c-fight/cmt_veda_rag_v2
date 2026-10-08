@@ -51,6 +51,7 @@ from discovery import (
 )
 import intake
 import worker
+from runtime_setup import validate_production_config
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cmt-veda-ai")
@@ -61,6 +62,9 @@ _gen_lock = threading.Lock()  # llama.cpp generation is not safely re-entrant
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Fail fast, naming the offending variable (never its value), instead of
+    # surfacing an unresolved placeholder as an opaque psycopg2 error.
+    validate_production_config()
     if not config.RAG_API_KEY:
         raise RuntimeError(
             "RAG_API_KEY is not configured. Refusing to start the RAG API without "
@@ -827,18 +831,30 @@ def _enqueue_and_drain(fn, *args, **kwargs):
     return result
 
 
+def _as_str(value):
+    """SQLite stores timestamps/ids as text; psycopg2 returns datetime (and
+    possibly UUID) objects for TIMESTAMPTZ/UUID columns. The contract
+    declares these response fields as strings, so normalise here. None
+    stays None; datetimes become ISO-8601."""
+    if value is None or isinstance(value, str):
+        return value
+    iso = getattr(value, "isoformat", None)
+    return iso() if callable(iso) else str(value)
+
+
 def _doc_to_intake_response(doc) -> "IntakeDocumentResponse":
     return IntakeDocumentResponse(
-        document_id=doc.document_id, source_id=doc.source_id, source_type=doc.source_type,
+        document_id=_as_str(doc.document_id), source_id=doc.source_id, source_type=doc.source_type,
         state=doc.approval_status.value, title=doc.title, authors=doc.authors, journal=doc.journal,
-        publication_date=doc.publication_date, doi=doc.doi, pmid=doc.pmid, trial_id=doc.trial_id,
+        publication_date=_as_str(doc.publication_date), doi=doc.doi, pmid=doc.pmid, trial_id=doc.trial_id,
         cmt_subtypes=doc.cmt_subtypes, genes=doc.genes, study_type=doc.study_type,
         source_tier=doc.source_tier, source_url=doc.source_url,
-        discovery_candidate_id=doc.discovery_candidate_id, source_format=doc.source_format,
-        uploaded_by=doc.uploaded_by, uploaded_at=doc.uploaded_at, original_filename=doc.original_filename,
-        retry_count=doc.retry_count, intake_batch_id=doc.intake_batch_id,
-        approved_by=doc.approved_by, approved_at=doc.approved_at,
-        created_at=doc.created_at, updated_at=doc.updated_at,
+        discovery_candidate_id=_as_str(doc.discovery_candidate_id), source_format=doc.source_format,
+        uploaded_by=doc.uploaded_by, uploaded_at=_as_str(doc.uploaded_at),
+        original_filename=doc.original_filename,
+        retry_count=doc.retry_count, intake_batch_id=_as_str(doc.intake_batch_id),
+        approved_by=doc.approved_by, approved_at=_as_str(doc.approved_at),
+        created_at=_as_str(doc.created_at), updated_at=_as_str(doc.updated_at),
     )
 
 

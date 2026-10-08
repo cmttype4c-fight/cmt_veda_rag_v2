@@ -1,6 +1,8 @@
 # Secrets / local env — NEVER commit real values of these
 .env
 .env.*
+*.env
+!*.env.example
 *.pem
 *.key
 

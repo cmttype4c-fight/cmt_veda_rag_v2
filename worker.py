@@ -88,21 +88,20 @@ def get_queue():
 def _rq_job_body(document_id: str, attempt: int) -> None:
     """The function RQ actually calls in the worker process. Rebuilds the
     db/embedder/vector_store from config inside the worker process itself
-    (a separate OS process from the FastAPI app — these objects are never
-    shared across the process boundary, by design: that's what makes this
-    actually asynchronous rather than a thread pool pretending to be one).
-    """
-    from main import build_db, build_embedder, build_vector_store  # local import: avoids a
-                                                                      # hard import-time dependency
-                                                                      # from worker.py -> main.py
-                                                                      # for callers that only need
-                                                                      # the InlineQueueAdapter path
+    (a separate OS process from the FastAPI app -- these objects are never
+    shared across the process boundary, by design). Fresh objects per job
+    also means the FAISS index is re-read from disk each time, so a job
+    always appends to the latest persisted state."""
+    from runtime_setup import build_db, build_embedder, build_vector_store
     db = build_db()
-    embedder = build_embedder()
-    vector_store = build_vector_store()
-    job = get_queue().fetch_job(_current_rq_job_id())
-    rq_job_id = job.id if job else str(uuid.uuid4())
-    process_intake_job(db, embedder, vector_store, document_id, rq_job_id, attempt, enqueue_processing)
+    try:
+        embedder = build_embedder()
+        vector_store = build_vector_store(embedder)
+        rq_job_id = _current_rq_job_id() or str(uuid.uuid4())
+        process_intake_job(db, embedder, vector_store, document_id, rq_job_id, attempt, enqueue_processing)
+    finally:
+        if hasattr(db, "close"):
+            db.close()
 
 
 def _current_rq_job_id() -> Optional[str]:
@@ -130,10 +129,21 @@ def enqueue_processing(document_id: str, attempt: int) -> str:
 
 def run_worker() -> None:
     """CLI entrypoint: `python worker.py`. Runs as a separate process from
-    the FastAPI app (`main.py`), listening on RQ_QUEUE_NAME."""
+    the FastAPI app (`main.py`), listening on RQ_QUEUE_NAME.
+
+    with_scheduler=True is required: retries after attempt 1 are enqueued
+    with Queue.enqueue_in() (exponential backoff), and RQ only moves those
+    delayed jobs onto the queue when a worker is running its scheduler.
+    Run exactly ONE worker process: each job appends to the on-disk vector
+    index, and concurrent writers would race."""
+    import logging
     import rq
-    with rq.Connection(get_redis_connection()):
-        rq.Worker([RQ_QUEUE_NAME]).work()
+    from runtime_setup import validate_production_config
+    logging.basicConfig(level=logging.INFO)
+    validate_production_config()
+    connection = get_redis_connection()
+    queue = rq.Queue(RQ_QUEUE_NAME, connection=connection)
+    rq.Worker([queue], connection=connection).work(with_scheduler=True)
 
 
 # ---------------------------------------------------------------------

@@ -1,0 +1,30 @@
+# Runtime dependencies for the RAG v2 image (API, RQ worker and migration job
+# all use the same image). Version ranges rather than exact pins: they could
+# not be resolved in the development sandbox, so tighten them to a lock file
+# after the first successful image build (`pip freeze` inside the image).
+#
+# torch is NOT listed here: the Dockerfile installs the CPU-only wheel first
+# so sentence-transformers does not pull the multi-GB CUDA build.
+
+# --- API ---
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.27,<1.0
+pydantic>=2.5,<3.0
+python-multipart>=0.0.9        # multipart PDF upload route
+
+# --- PostgreSQL backend (RAG_DB_BACKEND=postgres) ---
+psycopg2-binary>=2.9,<3.0
+
+# --- Async intake (RAG_QUEUE_BACKEND=redis_rq) ---
+redis>=5.0,<6.0
+rq>=1.16,<3.0
+
+# --- Ingestion / retrieval ---
+numpy>=1.26,<3.0
+scikit-learn>=1.3,<2.0
+pypdf>=4.0,<7.0
+sentence-transformers>=2.7,<6.0
+faiss-cpu>=1.8,<2.0
+
+# --- Generation (RAG_GENERATION_BACKEND=llama_cpp); compiled in the build stage ---
+llama-cpp-python>=0.2.80,<1.0

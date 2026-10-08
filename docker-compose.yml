@@ -1,0 +1,64 @@
+# RAG v2 production stack. Run from the repository root:
+#   docker compose up -d --build
+# Secrets come from the host file /opt/cmtveda/rag-v2/rag-v2.env (override the
+# location with RAG_ENV_FILE). It lives outside the repository, so no secret
+# ever lands in git or in the image.
+
+x-rag-common: &rag-common
+  build: .
+  image: cmtveda/rag-v2:local
+  env_file:
+    - ${RAG_ENV_FILE:-/opt/cmtveda/rag-v2/rag-v2.env}
+  environment: &rag-topology
+    # Non-secret topology, fixed here so it cannot be left as a placeholder.
+    RAG_DB_BACKEND: postgres
+    RAG_EMBEDDING_BACKEND: sentence_transformers
+    RAG_VECTOR_BACKEND: faiss
+    RAG_GENERATION_BACKEND: llama_cpp
+    RAG_QUEUE_BACKEND: redis_rq
+    RAG_REDIS_URL: redis://redis:6379/0
+    RAG_VECTOR_STORE_PATH: /opt/cmtveda/rag-v2/runtime/vector_store
+  volumes:
+    - /opt/cmtveda/rag-v2/runtime:/opt/cmtveda/rag-v2/runtime
+    - /opt/cmtveda/rag/runtime/models:/opt/cmtveda/rag/runtime/models:ro
+  extra_hosts:
+    - "host.docker.internal:host-gateway"   # reach PostgreSQL on the VPS host
+  restart: unless-stopped
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--dir", "/data"]
+    volumes:
+      - /opt/cmtveda/rag-v2/runtime/redis:/data
+    restart: unless-stopped
+    # No published port: reachable only by the other services on this network.
+
+  rag-v2-migrate:
+    <<: *rag-common
+    command: ["/app/deploy/migrate.sh"]
+    restart: "no"
+
+  rag-v2-api:
+    <<: *rag-common
+    container_name: rag-v2
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      redis: { condition: service_started }
+      rag-v2-migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5).status == 200 else 1)"]
+      interval: 15s
+      timeout: 8s
+      retries: 5
+      start_period: 120s
+
+  # EXACTLY ONE worker (the vector index has a single writer process).
+  rag-v2-worker:
+    <<: *rag-common
+    container_name: rag-v2-worker
+    command: ["python", "worker.py"]
+    depends_on:
+      redis: { condition: service_started }
+      rag-v2-migrate: { condition: service_completed_successfully }
