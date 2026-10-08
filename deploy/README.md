@@ -53,6 +53,7 @@ Docker bridge (`listen_addresses` and a `pg_hba.conf` entry for the docker subne
 ## Deploy
 ```sh
 git pull                                  # corrected Platform1 commit
+python3 deploy/check_context.py           # optional pre-build guard (see below)
 docker compose up -d --build              # builds, migrates, then starts api + worker + redis
 ./deploy/smoke_test.sh
 ```
@@ -60,6 +61,18 @@ Start order is enforced: `rag-v2-migrate` must exit 0 before the API/worker star
 Publishing is `127.0.0.1:8000 -> 8000`; mounts are
 `/opt/cmtveda/rag-v2/runtime` (rw) and `/opt/cmtveda/rag/runtime/models` (ro).
 Remove the old container first if its name collides: `docker rm -f rag-v2`.
+
+## Build context
+The repository root is the build context and the runtime directory
+(`/opt/cmtveda/rag-v2/runtime`: Redis AOF, FAISS index, documents) sits inside
+it on the VPS. `.dockerignore` excludes `/runtime` (and env files, models, dev
+stores) so that data is never sent to the daemon, is never read by the build,
+and is left untouched. Do not add `!` exceptions and do not write directory
+patterns as `name*/` (Docker drops the trailing `/`, so it also matches source
+files such as `vector_store.py`). `deploy/check_context.py` (also run as
+`test_docker_context.py`) fails if a source file is excluded or runtime/env
+paths would be sent; `deploy/check_modules.py` runs inside the build and fails
+it if a first-party module is missing from the image.
 
 ## Constraints
 - Run **one** worker (single writer of the FAISS index; RQ scheduler enabled for retries).

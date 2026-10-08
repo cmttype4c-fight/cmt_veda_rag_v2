@@ -1,24 +1,47 @@
-.git
-.gitignore
+# Build-context exclusions. Rules that matter here:
+#  * The repository is checked out at /opt/cmtveda/rag-v2 on the VPS, so the
+#    persistent runtime directory (/opt/cmtveda/rag-v2/runtime: Redis AOF,
+#    FAISS index, documents) lives INSIDE the build context. It must never be
+#    sent to the daemon: it is large, changes while building, and Redis'
+#    files are not readable by the build user ("permission denied").
+#  * Docker strips a trailing '/' from patterns, so 'name*/' would also match
+#    files such as vector_store.py. Anchor directory patterns without a
+#    wildcard (/vector_store), never 'vector_store*/'.
+#  * No '!' exceptions on purpose: with any exception present Docker may have
+#    to walk excluded directories to look for re-included files.
+# deploy/check_context.py verifies all of this before a build.
+
+# Runtime / persistent data (never part of the image)
+/runtime
+**/appendonlydir
+**/*.rdb
+/redis
+/data
+
+# Secrets and env files
 .env
 .env.*
 **/*.env
-deploy/*.env
-!deploy/*.env.example
-*.pem
-*.key
-*.gguf
+**/*.pem
+**/*.key
+
+# Model weights (mounted at run time)
+**/*.gguf
 /models
-__pycache__/
-*.pyc
-.pytest_cache/
-*.db
-# Anchored on purpose: Docker strips a trailing '/', so 'vector_store*/'
-# would also exclude the source file vector_store.py.
+
+# VCS / caches
+.git
+.gitignore
+**/__pycache__
+**/*.pyc
+.pytest_cache
+
+# Dev databases, dev vector stores, generated reports
+**/*.db
 /vector_store
 /faiss_index
-*.vecs.npy
-*.ids.json
+**/*.vecs.npy
+**/*.ids.json
 benchmark_report.json
 qwen_validation_report.json
 docs/*.pdf
